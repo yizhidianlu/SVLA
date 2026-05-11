@@ -202,7 +202,10 @@ class Pi0Backbone(VLABackbone):
                 f"SigLIP output shape {tuple(out.shape)} does not match "
                 f"(B, {self.n_image_tokens}, {self.siglip_dim})"
             )
-        return out
+        # Cast back to float32 so the downstream DepthExpert (which is fp32 by
+        # default) doesn't trip LayerNorm's dtype check. SigLIP itself ran in
+        # bf16 (memory + speed); the boundary upcast is cheap.
+        return out.float()
 
     def _init_processor(self) -> None:
         """Lazy-init the VLAProcessor + PaliGemma tokenizer."""
