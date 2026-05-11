@@ -52,18 +52,20 @@ def test_backbone_load_raises_until_phase1_6() -> None:
 
 
 def test_submodule_pinned_on_disk() -> None:
-    """We pin open-pi-zero via git submodule; the directory must exist after `git submodule update --init`.
+    """If the submodule was checked out (clone with --recursive or
+    `git submodule update --init`), the upstream pizero.py must be on disk.
 
-    Skipped on machines where the submodule was never initialised (the
-    Phase-0 CI runner does `actions/checkout@v4` without --recursive, so
-    this test is informational only there).
+    `git submodule add` registers an empty placeholder directory even before
+    `update --init` is run, so `dir.exists()` is not enough to detect "not
+    initialised yet" — probe the inner file directly.
     """
     import pytest as _pytest
 
     from georel_vla.backbones.pi0 import THIRD_PARTY_OPEN_PI_ZERO
-    if not THIRD_PARTY_OPEN_PI_ZERO.exists():
+    pizero = THIRD_PARTY_OPEN_PI_ZERO / "src" / "model" / "vla" / "pizero.py"
+    if not pizero.is_file():
         _pytest.skip("open-pi-zero submodule not initialised in this checkout")
-    assert (THIRD_PARTY_OPEN_PI_ZERO / "src" / "model" / "vla" / "pizero.py").is_file()
+    assert pizero.is_file()
 
 
 def test_libero_geom_importable_without_mujoco() -> None:
