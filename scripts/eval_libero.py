@@ -42,6 +42,9 @@ def _set_egl_env() -> None:
     os.environ.setdefault("HF_HOME", "/root/autodl-tmp/hf")
 
 
+_PROPRIO_DIMS_FALLBACK = (3, 4, 1)  # eef pos + eef quat + gripper qpos = 8 dims
+
+
 # ----- LIBERO env setup --------------------------------------------------
 
 
@@ -87,11 +90,27 @@ def _build_policy(name: str, model_id: str, unnorm_key: str, device: str = "cuda
         return policy
 
     if name == "georel":
-        # Phase 1.7c.2 — load GeoRelVLA + Pi0Backbone with action head.
-        # Implementation lands once Pi0Backbone.forward_action() is wired.
-        raise NotImplementedError(
-            "GeoRel-VLA eval policy lands in Phase 1.7c.2 (action expert wiring)."
-        )
+        import torch
+
+        from georel_vla.backbones.pi0 import Pi0Backbone, Pi0BackboneConfig
+        bk = Pi0Backbone(Pi0BackboneConfig(device=device, dtype="bf16", load_paligemma=True))
+        bk.load()
+        # Optionally load a GeoRelVLA fine-tuned ckpt over the freshly-loaded
+        # PaliGemma weights. For Phase 1 this is the train.py output; if no
+        # path passed, eval runs on the PaliGemma-init backbone (sanity baseline).
+        if model_id and Path(model_id).is_file():
+            state = torch.load(model_id, map_location=device, weights_only=False)
+            bk.pizero.load_state_dict(state["model_state_dict"], strict=False)
+
+        def policy(obs_rgb: np.ndarray, language: str) -> np.ndarray:
+            rgb_u8 = torch.from_numpy(obs_rgb).permute(2, 0, 1).unsqueeze(0).contiguous().to(device)
+            # NOTE: caller must arrange to pass full obs (not just rgb) when using georel;
+            # for now, construct zero proprio fallback. Phase 1.7d wires real obs.
+            proprios = torch.zeros(1, 1, sum(_PROPRIO_DIMS_FALLBACK), device=device)
+            actions = bk.infer_action(rgb_u8, [language], proprios)  # (1, horizon, action_dim)
+            return actions[0, 0].cpu().float().numpy()
+
+        return policy
 
     raise ValueError(f"unknown --policy {name!r}; expected openvla | georel")
 

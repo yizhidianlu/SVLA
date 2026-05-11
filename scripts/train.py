@@ -28,7 +28,6 @@ import json
 import logging
 import sys
 import time
-from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 
@@ -44,12 +43,15 @@ def _lazy_torch():
 
 
 class _LiberoShardDataset:
-    """Iterate (rgb, depth) frames from `extract_libero_depth_gt.py` shards.
+    """Iterate (rgb, depth, action, proprio, language) frames from shards.
 
     Re-implements just the streaming bit so training can run without spinning
     up torch.utils.data DataLoader workers (which on Windows with the wrong
-    spawn semantics tend to fight MuJoCo). For Phase 1.7c.1 a single-process
-    Python generator is plenty.
+    spawn semantics tend to fight MuJoCo).
+
+    `proprio` and `language` are absent on shards written before extractor v3
+    (Phase 1.7c.2 bumped that). When absent, `proprio` defaults to zeros and
+    `language` defaults to '' so the dataset survives mixed-vintage shards.
     """
 
     def __init__(
@@ -58,17 +60,21 @@ class _LiberoShardDataset:
         depth_clip_m: float = 5.0,
         shuffle_shards: bool = True,
         seed: int = 0,
+        proprio_dim_fallback: int = 8,   # 3 (eef pos) + 4 (eef quat) + 1 (gripper qpos)
     ) -> None:
         self.data_dir = Path(data_dir)
         self.depth_clip_m = depth_clip_m
         self.shuffle_shards = shuffle_shards
         self.rng = np.random.default_rng(seed)
+        self.proprio_dim_fallback = proprio_dim_fallback
 
         self.shards = sorted(self.data_dir.glob("*.npz"))
         if not self.shards:
             raise FileNotFoundError(f"no .npz shards under {self.data_dir}")
 
-    def stream(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    def stream(self):
+        """Yield per-frame (rgb, depth, action, proprio, language) tuples."""
+        import json as _json
         order = list(range(len(self.shards)))
         if self.shuffle_shards:
             self.rng.shuffle(order)
@@ -77,21 +83,41 @@ class _LiberoShardDataset:
             rgb = shard["rgb"]                                  # (T, H, W, 3) uint8
             depth = shard["depth"].astype(np.float32)            # (T, H, W) float16/32
             np.clip(depth, 0.0, self.depth_clip_m, out=depth)
+            action = shard["action"].astype(np.float32) if "action" in shard.files else np.zeros((rgb.shape[0], 7), np.float32)
+            if "proprio" in shard.files:
+                proprio = shard["proprio"].astype(np.float32)
+            else:
+                proprio = np.zeros((rgb.shape[0], self.proprio_dim_fallback), np.float32)
+            try:
+                lang = _json.loads(str(shard["meta"])).get("language", "") if "meta" in shard.files else ""
+            except Exception:
+                lang = ""
             for t in range(rgb.shape[0]):
-                yield rgb[t], depth[t]
+                yield rgb[t], depth[t], action[t], proprio[t], lang
 
-    def batches(self, batch_size: int) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        rgb_buf: list[np.ndarray] = []
-        depth_buf: list[np.ndarray] = []
-        for rgb, depth in self.stream():
+    def batches(self, batch_size: int):
+        rgb_buf: list = []
+        depth_buf: list = []
+        action_buf: list = []
+        proprio_buf: list = []
+        lang_buf: list = []
+        for rgb, depth, action, proprio, lang in self.stream():
             rgb_buf.append(rgb)
             depth_buf.append(depth)
+            action_buf.append(action)
+            proprio_buf.append(proprio)
+            lang_buf.append(lang)
             if len(rgb_buf) >= batch_size:
-                yield np.stack(rgb_buf, 0), np.stack(depth_buf, 0)
+                yield (np.stack(rgb_buf, 0), np.stack(depth_buf, 0),
+                       np.stack(action_buf, 0), np.stack(proprio_buf, 0), list(lang_buf))
                 rgb_buf.clear()
                 depth_buf.clear()
+                action_buf.clear()
+                proprio_buf.clear()
+                lang_buf.clear()
         if rgb_buf:
-            yield np.stack(rgb_buf, 0), np.stack(depth_buf, 0)
+            yield (np.stack(rgb_buf, 0), np.stack(depth_buf, 0),
+                   np.stack(action_buf, 0), np.stack(proprio_buf, 0), list(lang_buf))
 
 
 # ----- training ----------------------------------------------------------
@@ -203,21 +229,47 @@ def main() -> int:
     for epoch in range(args.epochs):
         ep_start = time.time()
         ep_batches = 0
-        for rgb_np, depth_np in ds.batches(args.batch):
+        for rgb_np, depth_np, action_np, proprio_np, lang_list in ds.batches(args.batch):
             rgb = _to_rgb_tensor(rgb_np, args.image_size, args.device)
-            # depth: encode on GPU through frozen VQ-VAE -> per-spatial indices
             depth = torch.from_numpy(depth_np).to(args.device).unsqueeze(1)   # (B, 1, H, W)
             with torch.no_grad():
                 indices = vq.encode_indices(depth).reshape(depth.size(0), -1)  # (B, N_lat)
 
             out = model(rgb, depth_target_indices=indices)
-            # compute_losses applies λ·γ^step decay internally
-            losses = model.compute_losses(
-                depth_logits=out["depth_logits"],
-                depth_target_indices=indices,
-                step=step,
-                gamma=args.lambda_gamma,
-            )
+
+            # action-side: only when --backbone pi0 (StubBackbone has no action expert)
+            action_pred = None
+            action_target = None
+            if args.backbone == "pi0":
+                B = rgb.size(0)
+                # rgb_uint8 for VLAProcessor (it asserts uint8 + rescales internally)
+                rgb_u8 = torch.from_numpy(rgb_np).permute(0, 3, 1, 2).contiguous().to(args.device)
+                proprios = torch.from_numpy(proprio_np).unsqueeze(1).to(args.device)  # (B, T=1, P)
+                actions = torch.from_numpy(action_np).unsqueeze(1).to(args.device)    # (B, H=1, A)
+                # If LIBERO chunk size mismatches PiZero horizon_steps, broadcast across horizon.
+                horizon = backbone.pizero.horizon_steps if hasattr(backbone, "pizero") else 4
+                if actions.size(1) != horizon:
+                    actions = actions.expand(B, horizon, actions.size(-1)).contiguous()
+                # Sample flow-matching t — uniform here; train.py from upstream uses Beta in beta mode.
+                t = torch.rand(B, device=args.device)
+                action_loss = backbone.forward_action_loss(
+                    rgb_u8, lang_list, proprios, actions, t,
+                )
+                # Surface as both `action_pred` placeholder and a separate explicit term
+                action_target = torch.zeros_like(action_loss)  # so compute_losses MSE adds 0
+                action_pred = action_loss
+                losses = model.compute_losses(
+                    depth_logits=out["depth_logits"],
+                    depth_target_indices=indices,
+                    action_pred=action_pred, action_target=action_target,
+                    step=step, gamma=args.lambda_gamma,
+                )
+            else:
+                losses = model.compute_losses(
+                    depth_logits=out["depth_logits"],
+                    depth_target_indices=indices,
+                    step=step, gamma=args.lambda_gamma,
+                )
             opt.zero_grad()
             losses["total"].backward()
             opt.step()
@@ -232,10 +284,13 @@ def main() -> int:
                     "lambda_t": float(losses["lambda_depth_t"].item()),
                     "elapsed_sec": time.time() - t_start,
                 }
+                if "action" in losses:
+                    row["loss_action"] = float(losses["action"].item())
                 metrics.append(row)
                 log.info(
-                    "ep=%d step=%d total=%.4f depth=%.4f lambda_t=%.4g t=%.0fs",
+                    "ep=%d step=%d total=%.4f depth=%.4f action=%s lambda_t=%.4g t=%.0fs",
                     epoch, step, row["loss_total"], row["loss_depth"],
+                    f"{row['loss_action']:.4f}" if "loss_action" in row else "n/a",
                     row["lambda_t"], row["elapsed_sec"],
                 )
 

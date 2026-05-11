@@ -65,7 +65,10 @@ class LiberoExtractorConfig:
     max_demos_per_task: int | None = None  # None = all demos in the .hdf5
     stride: int = 1                       # keep every `stride`-th frame; 1 = keep all
     save_action: bool = True
-    save_proprio: bool = False            # off for Phase 1 (VQ-VAE only needs depth)
+    save_proprio: bool = True             # eef pos+quat+gripper for Phase 1.7c action loss
+    proprio_keys: tuple[str, ...] = (     # standard LIBERO obs names; concatenated as proprio
+        "robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos",
+    )
     compress: bool = True                 # use np.savez_compressed
     skip_existing: bool = True
     seed: int = 0
@@ -83,6 +86,7 @@ class LiberoFrame:
     rgb: np.ndarray          # (H, W, 3) uint8
     depth: np.ndarray        # (H, W) float32 — metric meters by default; raw z-buffer if metric_depth=False
     action: np.ndarray       # (action_dim,) float32
+    proprio: np.ndarray | None  # (proprio_dim,) float32 if cfg.save_proprio else None
     step: int
 
 
@@ -289,7 +293,17 @@ class LiberoDepthExtractor:
             if self.cfg.metric_depth:
                 depth = camera_utils.get_real_depth_map(sim, depth.astype(np.float32))
                 np.clip(depth, 0.0, self.cfg.depth_clip_m, out=depth)
-            yield LiberoFrame(rgb=rgb, depth=depth, action=action, step=t)
+            proprio: np.ndarray | None = None
+            if self.cfg.save_proprio:
+                pieces = []
+                for k in self.cfg.proprio_keys:
+                    v = obs.get(k)
+                    if v is None:
+                        continue
+                    pieces.append(np.asarray(v, dtype=np.float32).reshape(-1))
+                if pieces:
+                    proprio = np.concatenate(pieces, axis=0)
+            yield LiberoFrame(rgb=rgb, depth=depth, action=action, proprio=proprio, step=t)
 
     def _save_npz(
         self,
@@ -304,6 +318,9 @@ class LiberoDepthExtractor:
         rgb = np.stack([f.rgb for f in frames], axis=0).astype(np.uint8)        # (T,H,W,3)
         depth = np.stack([f.depth for f in frames], axis=0).astype(np.float16)  # (T,H,W)
         action = np.stack([f.action for f in frames], axis=0).astype(np.float32)  # (T,A)
+        proprio_arr = None
+        if self.cfg.save_proprio and frames[0].proprio is not None:
+            proprio_arr = np.stack([f.proprio for f in frames], axis=0).astype(np.float32)  # (T,P)
         meta = {
             "suite": suite,
             "task_id": int(task_id),
@@ -316,12 +333,17 @@ class LiberoDepthExtractor:
             "image_fix_applied": False,        # PSSA's 180-deg rotate is applied at training/eval time
             "depth_units": "meters" if self.cfg.metric_depth else "[0,1] normalised z-buffer (Robosuite native)",
             "depth_clip_m": float(self.cfg.depth_clip_m) if self.cfg.metric_depth else None,
-            "extractor_version": 2,            # bumped: metric-depth is now default
+            "proprio_keys": list(self.cfg.proprio_keys) if proprio_arr is not None else [],
+            "proprio_dim": int(proprio_arr.shape[-1]) if proprio_arr is not None else 0,
+            "extractor_version": 3,            # bumped: per-step proprio added (eef pos+quat+gripper concat)
             **self.cfg.extra_metadata,
         }
 
         save = np.savez_compressed if self.cfg.compress else np.savez
-        save(out_path, rgb=rgb, depth=depth, action=action, meta=json.dumps(meta))
+        save_kwargs = dict(rgb=rgb, depth=depth, action=action, meta=json.dumps(meta))
+        if proprio_arr is not None:
+            save_kwargs["proprio"] = proprio_arr
+        save(out_path, **save_kwargs)
         log.info(
             "wrote %s frames=%d rgb=%.1fMB depth=%.1fMB",
             out_path.name, rgb.shape[0],
