@@ -1,0 +1,3 @@
+[submodule "third_party/open-pi-zero"]
+	path = third_party/open-pi-zero
+	url = https://github.com/allenzren/open-pi-zero.git

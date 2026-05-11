@@ -1,0 +1,283 @@
+"""LIBERO simulator-GT depth (and RGB / proprio / action) extractor.
+
+For Phase 1 VQ-VAE pretraining we need clean depth supervision aligned with
+the RGB the policy sees. LIBERO is built on Robosuite + MuJoCo, so depth is
+directly queryable from the renderer — no monocular estimator needed (as
+QDepth-VLA's ViDA path on OXE was forced to).
+
+This module is the *library* — `LiberoDepthExtractor.replay_demo()` returns
+(rgb, depth, action, ...) frame by frame; `extract_to_npz()` writes one
+compressed `.npz` per demo, layout:
+
+    <out_dir>/<suite>/task<NN>_<demo_key>.npz   ->
+        rgb     : (T, H, W, 3) uint8
+        depth   : (T, H, W)    float16 in [0, 1]   (Robosuite's normalised z-buffer)
+        action  : (T, action_dim) float32
+        meta    : task_name, language, suite, task_id, H, W, camera, action_fix_applied (json)
+
+NB: the 180-degree image flip PSSA documented as `--libero-image-fix` is
+**NOT** applied here. We save the raw orientation that Robosuite emits and
+leave the flip to the training/eval pipeline (so the saved files are
+agnostic to which backbone consumes them).
+
+Imports of `libero` / `robosuite` / `h5py` are deferred to method scope so
+this module is importable on machines that do not have MuJoCo (e.g., the CI
+Ubuntu runner without GPU).
+
+The companion CLI lives at `scripts/extract_libero_depth_gt.py`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    import numpy as np
+
+log = logging.getLogger(__name__)
+
+# --- defaults sourced from the smoke run + PSSA workspace conventions -------
+
+DEFAULT_LIBERO_ROOT = Path("/root/autodl-tmp/LIBERO")
+DEFAULT_DEMOS_ROOT = Path("/root/autodl-tmp/datasets")
+DEFAULT_CAMERA = "agentview"
+DEFAULT_RESOLUTION = 256                  # LIBERO native render size; resize at training time
+DEFAULT_OUT_ROOT = Path("/autodl-fs/data/svla/data/libero_depth_gt")
+
+# Robosuite emits depth in [0,1] as normalised z-buffer; convert to metric on
+# the fly only if needed (the VQ-VAE doesn't care as long as we're consistent).
+
+
+@dataclass
+class LiberoExtractorConfig:
+    libero_root: Path = DEFAULT_LIBERO_ROOT
+    demos_root: Path = DEFAULT_DEMOS_ROOT
+    out_root: Path = DEFAULT_OUT_ROOT
+    camera: str = DEFAULT_CAMERA
+    resolution: int = DEFAULT_RESOLUTION
+    max_steps_per_demo: int = 400         # safety cap: LIBERO-Long demos can run ~300+ steps
+    max_demos_per_task: int | None = None  # None = all demos in the .hdf5
+    stride: int = 1                       # keep every `stride`-th frame; 1 = keep all
+    save_action: bool = True
+    save_proprio: bool = False            # off for Phase 1 (VQ-VAE only needs depth)
+    compress: bool = True                 # use np.savez_compressed
+    skip_existing: bool = True
+    seed: int = 0
+    extra_metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class LiberoFrame:
+    rgb: "np.ndarray"          # (H, W, 3) uint8
+    depth: "np.ndarray"        # (H, W)    float32 in [0, 1]
+    action: "np.ndarray"       # (action_dim,) float32
+    step: int
+
+
+class LiberoDepthExtractor:
+    """Replay LIBERO demos and yield / save (rgb, depth, action) frames.
+
+    Usage:
+
+        extractor = LiberoDepthExtractor(LiberoExtractorConfig())
+        for npz_path in extractor.extract_suite("libero_spatial", task_ids=range(10)):
+            print("wrote", npz_path)
+
+    or for in-memory frame iteration without disk IO:
+
+        for frame in extractor.replay_demo("libero_spatial", task_id=0, demo_idx=0):
+            ...
+    """
+
+    def __init__(self, cfg: LiberoExtractorConfig | None = None) -> None:
+        self.cfg = cfg or LiberoExtractorConfig()
+        # set EGL env vars so off-screen rendering works on headless GPU nodes
+        os.environ.setdefault("MUJOCO_GL", "egl")
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+    # --- public API -------------------------------------------------------
+
+    def extract_suite(
+        self,
+        suite: str,
+        task_ids: list[int] | range | None = None,
+    ) -> Iterator[Path]:
+        """Yield npz file path for every demo of every requested task in `suite`."""
+        bench = self._load_benchmark(suite)
+        all_task_ids = range(bench.n_tasks) if task_ids is None else list(task_ids)
+        for tid in all_task_ids:
+            yield from self.extract_task(suite, tid)
+
+    def extract_task(self, suite: str, task_id: int) -> Iterator[Path]:
+        """Yield npz path for every demo in `<suite>/<task>_demo.hdf5`."""
+        import h5py
+
+        bench = self._load_benchmark(suite)
+        task = bench.get_task(task_id)
+        demo_path = self._demo_path(suite, task)
+        if not demo_path.is_file():
+            raise FileNotFoundError(f"demo file not found: {demo_path}")
+
+        out_dir = self.cfg.out_root / suite
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        with h5py.File(demo_path, "r") as f:
+            demo_keys = sorted(f["data"].keys())
+            if self.cfg.max_demos_per_task is not None:
+                demo_keys = demo_keys[: self.cfg.max_demos_per_task]
+
+            init_states = bench.get_task_init_states(task_id)
+
+            for demo_idx, demo_key in enumerate(demo_keys):
+                out_path = out_dir / f"task{task_id:02d}_{demo_key}.npz"
+                if self.cfg.skip_existing and out_path.is_file():
+                    log.info("skip (exists): %s", out_path.name)
+                    yield out_path
+                    continue
+
+                frames = list(
+                    self._replay_demo_inner(
+                        suite, task, task_id, demo_idx, demo_key,
+                        init_states, demo_actions=f["data"][demo_key]["actions"][:],
+                    )
+                )
+                if not frames:
+                    log.warning("no frames produced for %s demo %s", suite, demo_key)
+                    continue
+
+                self._save_npz(out_path, suite, task, task_id, frames)
+                yield out_path
+
+    def replay_demo(
+        self,
+        suite: str,
+        task_id: int,
+        demo_idx: int = 0,
+    ) -> Iterator[LiberoFrame]:
+        """Yield per-step LiberoFrame for `(suite, task_id, demo_idx)`. No disk IO."""
+        import h5py
+
+        bench = self._load_benchmark(suite)
+        task = bench.get_task(task_id)
+        demo_path = self._demo_path(suite, task)
+        with h5py.File(demo_path, "r") as f:
+            demo_keys = sorted(f["data"].keys())
+            if demo_idx >= len(demo_keys):
+                raise IndexError(f"demo_idx {demo_idx} >= {len(demo_keys)} demos")
+            demo_key = demo_keys[demo_idx]
+            init_states = bench.get_task_init_states(task_id)
+            yield from self._replay_demo_inner(
+                suite, task, task_id, demo_idx, demo_key, init_states,
+                demo_actions=f["data"][demo_key]["actions"][:],
+            )
+
+    # --- internals --------------------------------------------------------
+
+    def _load_benchmark(self, suite: str):
+        from libero.libero.benchmark import get_benchmark
+        return get_benchmark(suite)()
+
+    def _demo_path(self, suite: str, task) -> Path:
+        # `task.problem_file_name` ends in `.bddl`; LIBERO datasets convention
+        # is `<problem_stem>_demo.hdf5` inside `<demos_root>/<suite>/`.
+        problem = Path(task.problem_file_name).stem  # strip .bddl
+        return self.cfg.demos_root / suite / f"{problem}_demo.hdf5"
+
+    def _make_env(self, suite: str, task):
+        from libero.libero.envs import OffScreenRenderEnv
+
+        bddl_root = self.cfg.libero_root / "libero" / "libero" / "bddl_files" / suite
+        bddl_file = bddl_root / task.problem_file_name
+        if not bddl_file.is_file():
+            raise FileNotFoundError(f"bddl file not found: {bddl_file}")
+
+        env = OffScreenRenderEnv(
+            bddl_file_name=str(bddl_file),
+            camera_heights=self.cfg.resolution,
+            camera_widths=self.cfg.resolution,
+            camera_depths=True,                       # the whole point
+            camera_names=[self.cfg.camera],
+        )
+        env.seed(self.cfg.seed)
+        return env
+
+    def _replay_demo_inner(
+        self,
+        suite: str,
+        task,
+        task_id: int,
+        demo_idx: int,
+        demo_key: str,
+        init_states,
+        demo_actions,
+    ) -> Iterator[LiberoFrame]:
+        import numpy as np
+
+        env = self._make_env(suite, task)
+        try:
+            env.reset()
+            env.set_init_state(init_states[demo_idx])
+            n_steps = min(int(len(demo_actions)), int(self.cfg.max_steps_per_demo))
+            for t in range(n_steps):
+                action = np.asarray(demo_actions[t], dtype=np.float32)
+                obs, _, _, _ = env.step(action)
+                if t % self.cfg.stride != 0:
+                    continue
+                rgb = np.asarray(obs[f"{self.cfg.camera}_image"], dtype=np.uint8)
+                depth = np.asarray(obs[f"{self.cfg.camera}_depth"], dtype=np.float32)
+                # depth shape may be (H, W, 1); squeeze to (H, W)
+                if depth.ndim == 3 and depth.shape[-1] == 1:
+                    depth = depth[..., 0]
+                yield LiberoFrame(rgb=rgb, depth=depth, action=action, step=t)
+        finally:
+            try:
+                env.close()
+            except Exception as exc:  # pragma: no cover
+                log.warning("env.close() raised %s — ignoring", exc)
+
+    def _save_npz(
+        self,
+        out_path: Path,
+        suite: str,
+        task,
+        task_id: int,
+        frames: list[LiberoFrame],
+    ) -> None:
+        import numpy as np
+
+        rgb = np.stack([f.rgb for f in frames], axis=0).astype(np.uint8)        # (T,H,W,3)
+        depth = np.stack([f.depth for f in frames], axis=0).astype(np.float16)  # (T,H,W)
+        action = np.stack([f.action for f in frames], axis=0).astype(np.float32)  # (T,A)
+        meta = {
+            "suite": suite,
+            "task_id": int(task_id),
+            "task_name": Path(task.problem_file_name).stem,
+            "language": getattr(task, "language", None) or "",
+            "camera": self.cfg.camera,
+            "resolution": int(self.cfg.resolution),
+            "n_frames": int(rgb.shape[0]),
+            "image_fix_applied": False,        # PSSA's 180-deg rotate is applied at training/eval time
+            "depth_range": "[0, 1] normalised z-buffer (Robosuite native)",
+            "extractor_version": 1,
+            **self.cfg.extra_metadata,
+        }
+
+        save = np.savez_compressed if self.cfg.compress else np.savez
+        save(out_path, rgb=rgb, depth=depth, action=action, meta=json.dumps(meta))
+        log.info(
+            "wrote %s frames=%d rgb=%.1fMB depth=%.1fMB",
+            out_path.name, rgb.shape[0],
+            rgb.nbytes / 1e6, depth.nbytes / 1e6,
+        )
+
+
+__all__ = [
+    "DEFAULT_LIBERO_ROOT", "DEFAULT_DEMOS_ROOT", "DEFAULT_CAMERA",
+    "DEFAULT_RESOLUTION", "DEFAULT_OUT_ROOT",
+    "LiberoExtractorConfig", "LiberoFrame", "LiberoDepthExtractor",
+]
