@@ -246,9 +246,19 @@ def main() -> int:
                 step=step, gamma=args.lambda_gamma,
             )
             if args.backbone == "pi0":
+                import torch.nn.functional as Fnn  # noqa: PLC0415
                 B = rgb.size(0)
-                # rgb_uint8 for VLAProcessor (asserts uint8 + rescales internally)
-                rgb_u8 = torch.from_numpy(rgb_np).permute(0, 3, 1, 2).contiguous().to(args.device)
+                # rgb_uint8 for VLAProcessor (asserts uint8 + rescales internally).
+                # PaliGemma SigLIP-So400m expects 224x224 input (16x16 patches at /14);
+                # LIBERO native is 256x256 — resize via bilinear in fp32, then cast back.
+                rgb_u8_native = torch.from_numpy(rgb_np).permute(0, 3, 1, 2).contiguous().to(args.device)
+                if rgb_u8_native.shape[-1] != args.image_size:
+                    rgb_u8 = Fnn.interpolate(
+                        rgb_u8_native.float(), size=(args.image_size, args.image_size),
+                        mode="bilinear", align_corners=False,
+                    ).clamp(0, 255).to(torch.uint8)
+                else:
+                    rgb_u8 = rgb_u8_native
                 proprios = torch.from_numpy(proprio_np).unsqueeze(1).to(args.device)  # (B, T=1, P)
                 actions = torch.from_numpy(action_np).unsqueeze(1).to(args.device)    # (B, H=1, A)
                 horizon = backbone.pizero.horizon_steps if hasattr(backbone, "pizero") else 4
