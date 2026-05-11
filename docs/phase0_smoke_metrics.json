@@ -1,0 +1,53 @@
+{
+  "suite": "libero_spatial",
+  "task_id": 0,
+  "task_name": "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate",
+  "task_language": "pick up the black bowl between the plate and the ramekin and place it on the plate",
+  "model_id": "openvla/openvla-7b-finetuned-libero-spatial",
+  "unnorm_key": "libero_spatial",
+  "n_rollouts": 5,
+  "n_success": 4,
+  "success_rate": 0.8,
+  "rollouts": [
+    {
+      "rollout": 0,
+      "success": true,
+      "steps": 94,
+      "step_ms_avg": 194.75680716494296,
+      "step_ms_p95": 197.06557989120483,
+      "peak_vram_gb": 15.44951552
+    },
+    {
+      "rollout": 1,
+      "success": true,
+      "steps": 99,
+      "step_ms_avg": 195.77305244676995,
+      "step_ms_p95": 206.50289058685303,
+      "peak_vram_gb": 15.44951552
+    },
+    {
+      "rollout": 2,
+      "success": false,
+      "steps": 200,
+      "step_ms_avg": 193.45821976661682,
+      "step_ms_p95": 208.02516937255854,
+      "peak_vram_gb": 15.44951552
+    },
+    {
+      "rollout": 3,
+      "success": true,
+      "steps": 78,
+      "step_ms_avg": 192.5060993585831,
+      "step_ms_p95": 198.40471744537354,
+      "peak_vram_gb": 15.44951552
+    },
+    {
+      "rollout": 4,
+      "success": true,
+      "steps": 70,
+      "step_ms_avg": 191.94539955684118,
+      "step_ms_p95": 198.1929063796997,
+      "peak_vram_gb": 15.44951552
+    }
+  ]
+}
