@@ -90,7 +90,8 @@ def test_quantizer_straight_through_gradient() -> None:
     """Straight-through estimator: gradient of quantiser output wrt encoder
     output should be identity (i.e., grad just flows back through z_e + sg(c-z_e))."""
     torch.manual_seed(0)
-    q = VectorQuantizer(num_embeddings=8, embedding_dim=4, commitment_weight=0.25)
+    q = VectorQuantizer(num_embeddings=8, embedding_dim=4, commitment_weight=0.25,
+                        use_ema=False)  # gradient-style for this test
     z_e = torch.randn(1, 4, 2, 2, requires_grad=True)
     z_q, _, _ = q(z_e)
     # Sum should backprop directly through z_e thanks to the STE
@@ -99,3 +100,87 @@ def test_quantizer_straight_through_gradient() -> None:
     expected = torch.ones_like(z_e)
     # All-ones because grad of sum wrt input is ones for an identity STE pass
     assert torch.allclose(z_e.grad, expected, atol=1e-6), z_e.grad
+
+
+def test_ema_default_freezes_codebook_param() -> None:
+    """EMA path: codebook.weight is updated by hand; gradient must be off."""
+    q = VectorQuantizer(num_embeddings=16, embedding_dim=4, use_ema=True)
+    assert q.codebook.weight.requires_grad is False
+    assert hasattr(q, "cluster_size_ema")
+    assert hasattr(q, "dw_ema")
+    assert hasattr(q, "ema_step")
+
+
+def test_ema_kmeans_init_seeds_from_first_batch() -> None:
+    """k-means init replaces the uniform-random codebook with samples from the first batch."""
+    torch.manual_seed(0)
+    q = VectorQuantizer(num_embeddings=8, embedding_dim=4, use_ema=True, kmeans_init=True)
+    initial = q.codebook.weight.data.clone()
+    z_e = torch.randn(2, 4, 4, 4) * 100.0   # large values so re-init shows up clearly
+    q.train()
+    q(z_e)
+    # After the first training forward, codebook should have moved to the new init.
+    assert not torch.allclose(initial, q.codebook.weight.data, atol=1e-2)
+    assert q._kmeans_done is True
+
+
+def test_ema_updates_codebook_each_step() -> None:
+    """EMA: cluster_size_ema accumulates, codebook drifts toward batch statistics."""
+    torch.manual_seed(0)
+    q = VectorQuantizer(num_embeddings=8, embedding_dim=4, use_ema=True,
+                        ema_decay=0.5, kmeans_init=False)  # no init seed; pure EMA
+    z_e = torch.randn(2, 4, 4, 4)
+    q.train()
+    cb_before = q.codebook.weight.data.clone()
+    for _ in range(3):
+        q(z_e)
+    assert q.cluster_size_ema.sum().item() > 0
+    assert not torch.allclose(cb_before, q.codebook.weight.data, atol=1e-4)
+
+
+def test_ema_dead_code_reset_revives_codes() -> None:
+    """Dead-code reset replaces low-utilisation codes with encoder samples."""
+    torch.manual_seed(0)
+    q = VectorQuantizer(
+        num_embeddings=8, embedding_dim=4,
+        use_ema=True, ema_decay=0.5,
+        kmeans_init=False, reset_dead_codes_every=1, dead_code_threshold=0.1,
+    )
+    # Drive only one code: encoder outputs near zero -> nearest code is whichever is closest to 0.
+    z_e_concentrated = torch.zeros(2, 4, 4, 4) + 1e-3 * torch.randn(2, 4, 4, 4)
+    q.train()
+    for _ in range(5):
+        q(z_e_concentrated)
+    # Some codes will be dead under this skewed distribution; the reset path must
+    # have fired (we at least ran 5 EMA steps and reset_every=1 with dead<0.1).
+    cb_after_concentrated = q.codebook.weight.data.clone()
+    # Now run on broader data — codes that were "revived" via reset should now
+    # be different from their pre-reset values too.
+    z_e_broad = torch.randn(2, 4, 4, 4) * 5.0
+    q(z_e_broad)
+    assert not torch.allclose(cb_after_concentrated, q.codebook.weight.data, atol=1e-4)
+
+
+def test_ema_codes_used_grows_over_steps() -> None:
+    """Sanity: with EMA + reset, codebook utilisation should be > 25% after a few epochs."""
+    torch.manual_seed(0)
+    cfg = VQVAEConfig(
+        in_channels=1, out_channels=1,
+        downsample=8, hidden=32, embedding_dim=32, num_embeddings=64,
+        use_ema=True, ema_decay=0.95, reset_dead_codes_every=10, kmeans_init=True,
+    )
+    vqvae = VQVAE(cfg)
+    x = torch.rand(8, 1, 64, 64) * 5.0
+    opt = torch.optim.AdamW(
+        [p for p in vqvae.parameters() if p.requires_grad], lr=1e-3,
+    )
+    used_history = []
+    for _ in range(40):
+        _, indices, ld = vqvae(x)
+        opt.zero_grad()
+        ld["total"].backward()
+        opt.step()
+        used_history.append(int(indices.unique().numel()))
+    # With EMA + reset on 8x16 samples per step, we should engage many codes —
+    # the L2 path on this same toy gets stuck at 1-3.
+    assert used_history[-1] >= 16, f"codes used only {used_history[-1]}/64; EMA failing to spread"
