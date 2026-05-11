@@ -234,16 +234,19 @@ class LiberoDepthExtractor:
         from robosuite.utils import camera_utils
 
         env = self._make_env(suite, task)
-        # Robosuite's underlying MjSim handle for metric depth conversion.
-        sim = getattr(env, "sim", None) or getattr(getattr(env, "env", None), "sim", None)
-        if self.cfg.metric_depth and sim is None:
-            raise RuntimeError(
-                "metric_depth=True requires a MuJoCo sim handle on env (env.sim or env.env.sim)"
-            )
-
         try:
             env.reset()
             env.set_init_state(init_states[demo_idx])
+            # NOTE: take the sim handle AFTER env.reset() / set_init_state.
+            # LIBERO/Robosuite re-instantiate the underlying MjSim on reset, so a
+            # reference captured before reset would be stale and `.model` unbound
+            # at first use ("'MjSim' object has no attribute 'model'").
+            sim = getattr(env, "sim", None) or getattr(getattr(env, "env", None), "sim", None)
+            if self.cfg.metric_depth and sim is None:
+                raise RuntimeError(
+                    "metric_depth=True requires a MuJoCo sim handle (env.sim or env.env.sim)"
+                )
+
             n_steps = min(int(len(demo_actions)), int(self.cfg.max_steps_per_demo))
             for t in range(n_steps):
                 action = np.asarray(demo_actions[t], dtype=np.float32)
