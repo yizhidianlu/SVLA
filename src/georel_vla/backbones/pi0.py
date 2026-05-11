@@ -37,12 +37,12 @@ import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    import torch
-    from torch import nn
+import torch
+from torch import nn
 
+from .base import VLABackbone
 
 THIRD_PARTY_OPEN_PI_ZERO = Path(__file__).resolve().parents[3] / "third_party" / "open-pi-zero"
 
@@ -84,13 +84,17 @@ class Pi0BackboneConfig:
     expose_siglip_features: bool = True     # whether forward() also returns pre-fusion image tokens
 
 
-class Pi0Backbone:
+class Pi0Backbone(VLABackbone):
     """Adapter exposing the slice of open-pi-zero our model.py + depth expert need.
 
-    Phase 1.6 will replace the stubs with calls into `third_party/open-pi-zero`.
+    Phase 1.7 will replace the stubs with calls into `third_party/open-pi-zero`.
     """
 
+    siglip_dim: int = 1152
+    n_image_tokens: int = 256
+
     def __init__(self, cfg: Pi0BackboneConfig | None = None) -> None:
+        super().__init__()
         self.cfg = cfg or Pi0BackboneConfig()
         self._pizero: nn.Module | None = None  # populated in load()
 
@@ -99,9 +103,9 @@ class Pi0Backbone:
     def load(self) -> None:
         """Instantiate the upstream PiZero and load the checkpoint.
 
-        Filled in Phase 1.6 — needs the Hydra config wiring.
+        Filled in Phase 1.7 — needs the Hydra config wiring.
         """
-        raise NotImplementedError("Phase 1.6 — see docstring at the top of this file.")
+        raise NotImplementedError("Phase 1.7 — see docstring at the top of this file.")
 
     # -- forward hooks the depth expert + model.py call -------------------
 
@@ -110,9 +114,9 @@ class Pi0Backbone:
 
         This is the slice that gets fed into the depth expert per
         QDepth-VLA §3.3 "before language fusion to avoid semantic
-        interference". Phase 1.6 wires this through PiZero's SigLIP module.
+        interference". Phase 1.7 wires this through PiZero's SigLIP module.
         """
-        raise NotImplementedError("Phase 1.6 — hooks into joint_model.vlm SigLIP.")
+        raise NotImplementedError("Phase 1.7 — hooks into joint_model.vlm SigLIP.")
 
     def forward_action(
         self,
@@ -122,22 +126,16 @@ class Pi0Backbone:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Standard PiZero forward returning (action_chunk, aux_dict).
 
-        Phase 1.6 wires through PiZero.forward / .generate_actions.
+        Phase 1.7 wires through PiZero.forward / .generate_actions.
         `aux_dict` will surface intermediates (SigLIP features, hybrid-attn
         layout) that the depth expert and the cross-head consistency loss
         in Phase 2 will consume.
         """
-        raise NotImplementedError("Phase 1.6 — calls PiZero.forward.")
+        raise NotImplementedError("Phase 1.7 — calls PiZero.forward.")
 
     # -- introspection ----------------------------------------------------
-
-    @property
-    def siglip_dim(self) -> int:
-        return 1152
-
-    @property
-    def n_image_tokens(self) -> int:
-        return 256
+    # siglip_dim / n_image_tokens are defined as class attrs above (matching
+    # the VLABackbone interface).
 
     def describe(self) -> dict[str, Any]:
         return {

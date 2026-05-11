@@ -15,9 +15,13 @@ def test_subpackages_import() -> None:
 
 
 def test_model_config_constructs() -> None:
+    """Phase 1.6: GeoRelVLA needs explicit backbone+expert+codebook.
+    `.from_config()` builds a stub-backbone version for CI/local smoke."""
+    import pytest
+    pytest.importorskip("torch")
     from georel_vla.model import GeoRelVLA, GeoRelVLAConfig
     cfg = GeoRelVLAConfig()
-    obj = GeoRelVLA(cfg)
+    obj = GeoRelVLA.from_config(cfg)
     assert obj.cfg.backbone == "open-pi-0"
     assert "depth" in repr(obj)
 
