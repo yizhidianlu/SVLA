@@ -68,13 +68,19 @@ class LiberoExtractorConfig:
     compress: bool = True                 # use np.savez_compressed
     skip_existing: bool = True
     seed: int = 0
+    # Convert MuJoCo's normalised z-buffer (non-linear, [0,1], dominated by far plane)
+    # to metric depth (meters) via robosuite.utils.camera_utils.get_real_depth_map.
+    # Without this the VQ-VAE codebook collapses because all values cluster
+    # tightly around 1.0 right at the far plane.
+    metric_depth: bool = True
+    depth_clip_m: float = 5.0             # clip metric depth to [0, depth_clip_m] for fp16 storage
     extra_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class LiberoFrame:
     rgb: "np.ndarray"          # (H, W, 3) uint8
-    depth: "np.ndarray"        # (H, W)    float32 in [0, 1]
+    depth: "np.ndarray"        # (H, W) float32 — metric meters by default; raw z-buffer if metric_depth=False
     action: "np.ndarray"       # (action_dim,) float32
     step: int
 
@@ -225,8 +231,16 @@ class LiberoDepthExtractor:
         demo_actions,
     ) -> Iterator[LiberoFrame]:
         import numpy as np
+        from robosuite.utils import camera_utils
 
         env = self._make_env(suite, task)
+        # Robosuite's underlying MjSim handle for metric depth conversion.
+        sim = getattr(env, "sim", None) or getattr(getattr(env, "env", None), "sim", None)
+        if self.cfg.metric_depth and sim is None:
+            raise RuntimeError(
+                "metric_depth=True requires a MuJoCo sim handle on env (env.sim or env.env.sim)"
+            )
+
         try:
             env.reset()
             env.set_init_state(init_states[demo_idx])
@@ -241,6 +255,10 @@ class LiberoDepthExtractor:
                 # depth shape may be (H, W, 1); squeeze to (H, W)
                 if depth.ndim == 3 and depth.shape[-1] == 1:
                     depth = depth[..., 0]
+                if self.cfg.metric_depth:
+                    # OpenGL z-buffer (non-linear, [0,1]) -> metric depth (meters).
+                    depth = camera_utils.get_real_depth_map(sim, depth.astype(np.float32))
+                    np.clip(depth, 0.0, self.cfg.depth_clip_m, out=depth)
                 yield LiberoFrame(rgb=rgb, depth=depth, action=action, step=t)
         finally:
             try:
@@ -271,8 +289,9 @@ class LiberoDepthExtractor:
             "resolution": int(self.cfg.resolution),
             "n_frames": int(rgb.shape[0]),
             "image_fix_applied": False,        # PSSA's 180-deg rotate is applied at training/eval time
-            "depth_range": "[0, 1] normalised z-buffer (Robosuite native)",
-            "extractor_version": 1,
+            "depth_units": "meters" if self.cfg.metric_depth else "[0,1] normalised z-buffer (Robosuite native)",
+            "depth_clip_m": float(self.cfg.depth_clip_m) if self.cfg.metric_depth else None,
+            "extractor_version": 2,            # bumped: metric-depth is now default
             **self.cfg.extra_metadata,
         }
 
