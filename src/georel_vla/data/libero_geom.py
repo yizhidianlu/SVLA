@@ -183,18 +183,26 @@ class LiberoDepthExtractor:
         return get_benchmark(suite)()
 
     def _demo_path(self, suite: str, task) -> Path:
-        # `task.problem_file_name` ends in `.bddl`; LIBERO datasets convention
-        # is `<problem_stem>_demo.hdf5` inside `<demos_root>/<suite>/`.
-        problem = Path(task.problem_file_name).stem  # strip .bddl
-        return self.cfg.demos_root / suite / f"{problem}_demo.hdf5"
+        # LIBERO Task namedtuple: `task.name` (stem), `task.bddl_file`
+        # (basename with .bddl), `task.problem_folder` (suite). Datasets
+        # convention is `<task.name>_demo.hdf5` inside `<demos_root>/<suite>/`.
+        return self.cfg.demos_root / suite / f"{task.name}_demo.hdf5"
 
     def _make_env(self, suite: str, task):
+        from libero.libero import get_libero_path
         from libero.libero.envs import OffScreenRenderEnv
 
-        bddl_root = self.cfg.libero_root / "libero" / "libero" / "bddl_files" / suite
-        bddl_file = bddl_root / task.problem_file_name
+        # Prefer LIBERO's own resolver so tests don't pin to autodl-tmp paths.
+        bddl_dir = Path(get_libero_path("bddl_files"))
+        bddl_file = bddl_dir / task.problem_folder / task.bddl_file
         if not bddl_file.is_file():
-            raise FileNotFoundError(f"bddl file not found: {bddl_file}")
+            # Fallback to our configured libero_root tree.
+            bddl_file = (
+                self.cfg.libero_root / "libero" / "libero" / "bddl_files"
+                / task.problem_folder / task.bddl_file
+            )
+        if not bddl_file.is_file():
+            raise FileNotFoundError(f"bddl file not found under either resolver: {bddl_file}")
 
         env = OffScreenRenderEnv(
             bddl_file_name=str(bddl_file),
@@ -256,8 +264,9 @@ class LiberoDepthExtractor:
         meta = {
             "suite": suite,
             "task_id": int(task_id),
-            "task_name": Path(task.problem_file_name).stem,
+            "task_name": getattr(task, "name", "") or "",
             "language": getattr(task, "language", None) or "",
+            "bddl_file": getattr(task, "bddl_file", "") or "",
             "camera": self.cfg.camera,
             "resolution": int(self.cfg.resolution),
             "n_frames": int(rgb.shape[0]),
