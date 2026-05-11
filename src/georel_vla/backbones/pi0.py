@@ -153,15 +153,19 @@ class Pi0Backbone(VLABackbone):
             return
 
         log.info("Pi0Backbone: loading PaliGemma weights from %s", pal_dir)
+        # PiZero.load_pretrained_weights() takes no positional args — it reads
+        # self.cfg.pretrained_model_path. Inject our resolved path into the
+        # OmegaConf cfg before calling.
+        from omegaconf import OmegaConf
+        OmegaConf.set_struct(self._pizero.cfg, False)
+        self._pizero.cfg.pretrained_model_path = str(pal_dir)
         try:
-            self._pizero.load_pretrained_weights(str(pal_dir))  # upstream method
-        except AttributeError:
-            # Older open-pi-zero releases used a free function — try it.
-            try:
-                from src.model.vla.utils import load_paligemma_weights
-                load_paligemma_weights(self._pizero, str(pal_dir))
-            except Exception as exc:
-                log.warning("PaliGemma load helper not found (%s); leaving random-init", exc)
+            self._pizero.load_pretrained_weights()
+        except Exception as exc:
+            log.warning(
+                "PaliGemma load failed (%s); leaving SigLIP / Gemma random-init. "
+                "Phase 1.7c training will need real weights.", exc,
+            )
 
     # -- forward hooks ----------------------------------------------------
 
