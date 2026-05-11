@@ -1,0 +1,105 @@
+{
+  "schema_version": "1.0",
+  "workspace": "20260511121847e9b8",
+  "stage": "PLANNING",
+  "candidate_name": "GeoRel-VLA",
+  "candidate_name_status": "locked_at_user_signoff_2026-05-11",
+  "thesis": "Replace 2D-region visual grounding in VLA models with three decoupled geometric prediction heads (depth + surface normal + plane segmentation) and one functional relational head (object support) tied to the geometric heads via a derivability constraint, so the policy reasons in a structured, decomposable spatial schema. Contact relations emerge as the geometric prerequisite the constraint enforces, not as a separately supervised head. Target the regimes where 2D-region grounding visibly fails: occlusion, long-horizon multi-stage manipulation, fine-grained placement / stacking.",
+  "head_count": 4,
+  "head_count_rationale": "Down from initial 5. Contact head removed because L_dr derivability constraint on the support head subsumes it: support head's per-edge contact-patch attention is forced (i) to overlap A's and B's depth-back-projected masks, (ii) to lie within a single plane region, (iii) to be gravity-aligned. This produces a usable contact representation without independent supervision and avoids the 'module bloat' user feedback.",
+  "research_questions": [
+    {"id": "RQ1", "question": "Does adding depth + normal + plane as three decoupled auxiliary heads outperform single-head depth-only auxiliary supervision (i.e., QDepth-VLA)?", "phase": 2, "metric": "LIBERO single-view avg SR", "target": "+1.5pp on >= 2 of 4 LIBERO suites"},
+    {"id": "RQ2", "question": "Does the cross-head consistency loss improve any head's downstream task contribution vs three independently trained heads?", "phase": 2, "metric": "LIBERO single-view avg SR", "target": "removing L_xc hurts avg by >= 0.5pp"},
+    {"id": "RQ3", "question": "Does an explicit support head provide measurable additional gain on stacking-/placement-heavy tasks beyond geometric heads alone?", "phase": 3, "metric": "Simpler Stack-Block + real Piper stack-on-yellow", "target": ">= 5pp Stack-Block, >= 15pp real Piper"},
+    {"id": "RQ4", "question": "Does the derivability constraint on the support head improve interpretability AND induce a usable implicit contact representation, without sacrificing downstream SR?", "phase": 3, "metric": "(a) downstream SR within +/- 0.5pp of no-L_dr variant; (b) contact-patch attention vs Robosuite contact GT F1 >= 0.85 (with L_dr) vs <= 0.50 (without L_dr)", "target": "Both (a) and (b)"}
+  ],
+  "method": {
+    "backbone": "open-pi-0",
+    "vlm": "PaliGemma-3B (SigLIP visual + Gemma 2B language)",
+    "action_head": "Transformer 18 layers / 8 heads / 1024 hidden, CFM (Conditional Flow Matching) loss matching pi-0",
+    "auxiliary_experts": [
+      {"name": "depth_expert", "arch": "Transformer 18/8/1024", "input": "SigLIP features (pre-language)", "output": "K=256 quantized depth tokens via VQ-VAE codebook (latent 16x16, dim 160)", "loss": "CE", "weight_init": 0.01, "weight_schedule": "exp_decay gamma=0.9999"},
+      {"name": "normal_expert", "arch": "Transformer 18/8/1024", "input": "SigLIP features (pre-language)", "output": "K=128 quantized normal tokens via VQ-VAE codebook", "loss": "cosine-similarity-aware CE", "weight_init": 0.01, "weight_schedule": "ramp_up over 2 epochs then decay"},
+      {"name": "plane_expert", "arch": "Transformer 18/8/1024", "input": "SigLIP features (pre-language)", "output": "K=64 quantized plane-mask tokens via VQ-VAE codebook", "loss": "CE", "weight_init": 0.01, "weight_schedule": "ramp_up over 2 epochs then decay"},
+      {"name": "support_expert", "arch": "Graph attention 6 layers / 8 heads", "input": "image-region tokens augmented with depth + normal + plane outputs + proprio", "outputs": ["NxN support adjacency logits (BCE supervised)", "per-edge contact-patch attention map over depth-back-projected pixel grid (NOT independently supervised; shaped by L_dr)"], "loss": "BCE on support adjacency", "weight_init": 0.005, "weight_schedule": "ramp_up over epochs 4-8"}
+    ],
+    "consistency_losses": [
+      {"name": "L_xc", "weight": 0.002, "components": ["depth-normal orthogonality", "plane-normal variance within mask", "plane-depth RANSAC residual within mask"]},
+      {"name": "L_dr", "weight": 0.003, "components": ["contact-patch existence: support edge's contact-patch attention must overlap A's and B's depth-back-projected masks with min distance <= 1cm", "plane-aligned support patch: contact-patch attention on A must lie predominantly within a single plane-mask region", "gravity alignment: B's bottom face directly above contact patch in predicted gravity direction (misalignment_angle <= 15deg, vertical_offset <= 2cm)"], "note": "L_dr increased from 0.002 (5-head plan) to 0.003 because it is now the sole source of geometric grounding for the relational head"}
+    ],
+    "attention_design": "Hybrid mask (per QDepth-VLA): text/image attend within modality; each geometric expert attends to image+text; support expert attends to geometric outputs + image+proprio; action expert attends to all preceding"
+  },
+  "phases": [
+    {"id": 0, "name": "Setup", "wallclock_days": 1, "gpu_hours": 2, "cost_rmb": 14, "deliverable": "AutoDL A800 environment cloned from PSSA workspace; LIBERO smoke test 5/5 SR", "gate": "smoke OK in <= 5 min"},
+    {"id": 1, "name": "Reproduce QDepth-VLA", "wallclock_days": 2, "gpu_hours": 16, "cost_rmb": 112, "deliverable": "QDepth-VLA reproduction at LIBERO-Spatial >= 84.0 (within 2pp of paper 86.0)", "gate": "Phase-1 SR >= 84.0"},
+    {"id": 2, "name": "+normal +plane (RQ1, RQ2)", "wallclock_days": 5, "gpu_hours": 60, "cost_rmb": 400, "deliverable": "Phase-2 best variant + ablation (no-xc, -normal, -plane)", "gate": "RQ1: +1.5pp on >= 2 of 4 LIBERO suites; RQ2: -L_xc hurts >= 0.5pp"},
+    {"id": 3, "name": "+support w/ derivability (RQ3, RQ4)", "wallclock_days": 6, "gpu_hours": 75, "cost_rmb": 500, "deliverable": "Phase-3 best variant + L_dr ablation + real Piper 4 tasks", "gate": "RQ3: Stack-Block +5pp & real-Piper stack-on-yellow +15pp; RQ4: SR within +/- 0.5pp & contact-patch attention F1 >= 0.85 with L_dr vs <= 0.50 without"},
+    {"id": 4, "name": "Robustness + writeup", "wallclock_days": 5, "gpu_hours": 35, "cost_rmb": 250, "deliverable": "LIBERO-Plus + occluded-LIBERO; figure ckpt; SF-additive run", "gate": "no hard gate - publication-ready"}
+  ],
+  "compute_total": {"wallclock_days": 19, "gpu_hours": 188, "cost_rmb": 1276, "hardware": "AutoDL A800 80GB PCIe x 2 (per PSSA workspace topology)", "saved_vs_5head_plan": "1 day, 15 GPU-h, ~100 RMB by removing contact expert"},
+  "primary_benchmarks": [
+    {"name": "LIBERO-Spatial", "tasks": 10, "rollouts": 50, "introduced": "Phase 1"},
+    {"name": "LIBERO-Object", "tasks": 10, "rollouts": 50, "introduced": "Phase 2"},
+    {"name": "LIBERO-Goal", "tasks": 10, "rollouts": 50, "introduced": "Phase 2"},
+    {"name": "LIBERO-Long", "tasks": 10, "rollouts": 50, "introduced": "Phase 2"},
+    {"name": "Simpler-WidowX (Carrot/Eggplant/Spoon/Stack-Block)", "tasks": 4, "rollouts_per_task_min": 24, "introduced": "Phase 2d/3"},
+    {"name": "Simpler-Google-Robot", "tasks": 4, "rollouts_per_task_min": 24, "introduced": "Phase 3"},
+    {"name": "Real-world Piper (4 tasks)", "tasks": 4, "rollouts_per_task": 10, "introduced": "Phase 3d"},
+    {"name": "LIBERO-Plus", "tasks": 40, "rollouts": 50, "introduced": "Phase 4"},
+    {"name": "Custom occluded-LIBERO (25/50/75% box overlay)", "tasks": 10, "rollouts": 30, "introduced": "Phase 4"}
+  ],
+  "primary_baselines": [
+    {"name": "QDepth-VLA", "arxiv": "2510.14836", "libero_single_view_avg": 85.4, "libero_multi_view_avg": 94.9, "must": "reproduce in Phase 1"},
+    {"name": "OpenVLA-finetuned", "arxiv": "2406.09246", "libero_single_view_avg": 76.5, "must": "running in PSSA workspace at 80.2"},
+    {"name": "open-pi-0", "source": "github.com/allenzren/open-pi-zero", "libero_single_view_avg": 77.7, "libero_multi_view_avg": 94.2, "must": "reproduce as Phase 1 substrate"},
+    {"name": "CoT-VLA-7B", "arxiv": "2503.22020", "libero_single_view_avg": 81.1, "must": "cite published"},
+    {"name": "GeoVLA", "arxiv": "2508.09071", "libero_multi_view_avg": 97.7, "must": "cite published; uses 3D inputs at inference"},
+    {"name": "3D-CAVLA", "arxiv": "2505.05800", "libero_single_view_avg": 82.6, "libero_multi_view_avg": 98.1, "must": "cite published; upper bound"},
+    {"name": "GST-VLA", "arxiv": "2603.09079", "must": "READ FULL TEXT in Phase 0; reproduce or cite based on numbers"},
+    {"name": "Spatial Forcing", "arxiv": "2510.12276", "venue": "ICLR 2026", "must": "additive baseline in Phase 4 (GeoRel + SF alignment)"}
+  ],
+  "ablations": [
+    {"id": "qdepth-repro", "heads": ["depth"], "L_xc": false, "L_dr": false, "phase": 1},
+    {"id": "geo-3head-no-xc", "heads": ["depth", "normal", "plane"], "L_xc": false, "L_dr": false, "phase": "2c"},
+    {"id": "geo-3head", "heads": ["depth", "normal", "plane"], "L_xc": true, "L_dr": false, "phase": "2b"},
+    {"id": "geo-3head-no-normal", "heads": ["depth", "plane"], "L_xc": true, "L_dr": false, "phase": "2c"},
+    {"id": "geo-3head-no-plane", "heads": ["depth", "normal"], "L_xc": true, "L_dr": false, "phase": "2c"},
+    {"id": "geo+sup-no-dr", "heads": ["depth", "normal", "plane", "support"], "L_xc": true, "L_dr": false, "phase": "3c"},
+    {"id": "geo+sup", "heads": ["depth", "normal", "plane", "support"], "L_xc": true, "L_dr": true, "phase": "3b"},
+    {"id": "geo+sup+SF", "heads": ["depth", "normal", "plane", "support"], "L_xc": true, "L_dr": true, "additional_loss": "Spatial-Forcing alignment", "phase": 4}
+  ],
+  "smoke_gates": [
+    {"id": "gate-1", "test": "OpenVLA-7B-finetuned-libero-spatial 5 rollouts on libero_spatial:0 with PSSA --libero-action-fix and --libero-image-fix", "pass": "5/5 SR in <= 5 min wallclock"},
+    {"id": "gate-2", "test": "Pretrained depth VQ-VAE reconstructs 10 random LIBERO frames", "pass": "RMSE < 0.05 normalized depth"},
+    {"id": "gate-3", "test": "Pretrained normal VQ-VAE reconstructs 10 random Robosuite normals", "pass": "median angular error < 10 deg"},
+    {"id": "gate-4", "test": "Pretrained plane VQ-VAE reconstructs 10 random plane masks", "pass": "per-mask IoU > 0.80"},
+    {"id": "gate-5", "test": "Support extraction (& latent contact-patch GT for L_dr eval) on 50 hand-labeled LIBERO-Spatial frames", "pass": "Support F1 >= 0.90, contact-patch IoU >= 0.85"},
+    {"id": "gate-6", "test": "One-step fwd+bwd of full Phase-3 model (4 experts + 5 loss terms)", "pass": "no NaN, no OOM at batch 32 / A800"},
+    {"id": "gate-7", "test": "Phase-1 sanity: 1 epoch QDepth-VLA reproduction", "pass": "action-loss & depth-loss decrease monotonically"}
+  ],
+  "risks": [
+    {"id": "R1", "risk": "GST-VLA covers most differentiation", "mitigation": "Keep claim tight on decoupled heads + grounded support output (with L_dr-induced emergent contact) vs entangled Gaussian + token-stream CoT; reproduce or cite GST-VLA numbers head-to-head"},
+    {"id": "R2", "risk": "Spatial Forcing wins by being simpler", "mitigation": "Frame as complementary; include SF as additive baseline in Phase 4"},
+    {"id": "R3", "risk": "Pseudo-label noise on OXE", "mitigation": "Use Robosuite GT in LIBERO as primary; quantize all heads (CE not regression); ablate quantized vs regression"},
+    {"id": "R4", "risk": "Compute overrun > 1700 RMB", "mitigation": "Phase gating; halt before Phase 4 if Phase 3 over budget; submit Phase-2 result as workshop fallback"},
+    {"id": "R5", "risk": "Support gain is small", "mitigation": "Drop relational claim; reframe as multi-task geometric supervision paper (still publishable narrower)"},
+    {"id": "R6", "risk": "Two-workspace overlap with PSSA-VLA", "mitigation": "Deliberate independent literature per user; cite as concurrent work; emphasize axis difference"},
+    {"id": "R7", "risk": "L_dr does not actually induce a usable contact-patch representation (RQ4 fails)", "mitigation": "Honestly report; reframe paper as multi-geometry + supervised support; add an explicit contact-supervision baseline to show what was lost; this is a partial pivot, not project-killer"}
+  ],
+  "decisions_locked": [
+    {"item": "name", "value": "GeoRel-VLA"},
+    {"item": "head_cardinality", "value": 4, "heads": ["depth", "normal", "plane", "support"], "rationale": "user feedback: avoid module bloat; contact emerges from L_dr"},
+    {"item": "backbone", "value": "open-pi-0"},
+    {"item": "benchmark_triple", "value": ["LIBERO (4 suites)", "Simpler-WidowX (incl. Stack-Block)", "real Piper (4 tasks)"]},
+    {"item": "phased_gating", "value": "P1 reproduce QDepth-VLA -> P2 +normal +plane -> P3 +support w/ derivability; explicit go/no-go after each"},
+    {"item": "compute_envelope", "value": "1276 RMB / 19 wallclock days at 2x A800"},
+    {"item": "host_mode_continues", "value": true, "note": "Claude Code as engine for SETUP onward unless user later supplies API key"}
+  ],
+  "what_this_does_not_cover": [
+    "No code is written (SETUP / CODING produce Python)",
+    "No environment is provisioned (PSSA recipe inheritance is planned but not done)",
+    "No GT label extraction script is implemented (depth/normal/plane/support; contact-patch GT only for the L_dr-eval gate, not training supervision)",
+    "No real Piper arm reservation",
+    "GST-VLA only read via WebSearch summary; full-text read scheduled as Phase 0 first item"
+  ]
+}

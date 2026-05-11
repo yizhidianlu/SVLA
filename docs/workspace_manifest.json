@@ -1,0 +1,174 @@
+{
+  "schema_version": "1.1",
+  "session_id": "20260511121847e9b8",
+  "topic": "面向VLA模型的几何结构感知视觉对齐方法（深度/法向量/平面 → 接触/支撑关系）",
+  "topic_en": "Geometry-Structure Aware Visual Alignment for VLA: Depth, Normal, and Plane Supervision for Contact and Support Reasoning",
+  "topic_brief": "Replace 2D-region visual grounding in VLA models with depth, surface-normal, and plane-structure auxiliary supervision so the policy explicitly models target-object spatial position, contact, and support relations — improving robustness in occluded scenes, complex multi-step manipulation, and fine-grained tasks.",
+  "pipeline_mode": "evo",
+  "paper_mode": "original_research",
+  "current_stage": "SETUP",
+  "started_at": "2026-05-11T12:18:47+08:00",
+  "created_at": "2026-05-11T12:18:47+08:00",
+  "updated_at": "2026-05-11T13:08:00+08:00",
+  "host_mode": {
+    "engine": "claude-code",
+    "model": "claude-opus-4-7[1m]",
+    "rationale": "User requested HOST mode — Claude Code acts as research engine via WebSearch + Bash + file r/w; no external LLM API consumed. Workspace remains compatible with `nanoresearch resume` for downstream stages.",
+    "reads_config_api_key": false
+  },
+  "stages": {
+    "INIT": {
+      "stage": "INIT",
+      "status": "completed",
+      "started_at": "2026-05-11T12:18:47+08:00",
+      "completed_at": "2026-05-11T12:18:47+08:00",
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "IDEATION": {
+      "stage": "IDEATION",
+      "status": "completed",
+      "started_at": "2026-05-11T12:18:47+08:00",
+      "completed_at": "2026-05-11T12:35:00+08:00",
+      "retries": 0,
+      "error_message": "",
+      "output_path": "papers/literature_seed.md",
+      "artifacts": [
+        "papers/literature_seed.md",
+        "plans/ideation_summary.md"
+      ],
+      "key_finding": "Gap: no prior VLA jointly supervises (depth + normal + plane) as decoupled heads AND emits geometry-grounded symbolic (contact + support) relations. Closest competitors: QDepth-VLA (depth-only), GST-VLA (depth+covariance+DA-CoT but entangled), Spatial Forcing (implicit VGGT alignment). Differentiation = decoupled multi-task geometry + cross-head consistency + symbolic relational outputs.",
+      "candidate_name": "GeoRel-VLA",
+      "candidate_alternates": ["STAR-VLA", "MultiCue-VLA", "GeoStruct-VLA"],
+      "primary_competitors": ["QDepth-VLA (arXiv:2510.14836)", "GST-VLA (arXiv:2603.09079)", "Spatial Forcing (arXiv:2510.12276, ICLR 2026)", "GeoVLA (arXiv:2508.09071)", "GraphCoT-VLA (arXiv:2508.07650)"],
+      "papers_surveyed": 30,
+      "decision_items_for_user": [
+        "Adopt GeoRel-VLA as working name?",
+        "5 auxiliary heads (depth + normal + plane + contact + support) is the right cardinality?",
+        "open-pi-0 as action backbone (matches QDepth-VLA & PSSA workspace)?",
+        "LIBERO + Simpler-WidowX + real-Piper as benchmark triple (CALVIN ABC-D optional)?",
+        "3-phase staged gating (P1: reproduce QDepth-VLA; P2: +normal +plane; P3: +contact +support) as the path forward?"
+      ]
+    },
+    "PLANNING": {
+      "stage": "PLANNING",
+      "status": "completed",
+      "started_at": "2026-05-11T12:35:00+08:00",
+      "completed_at": "2026-05-11T12:48:00+08:00",
+      "retries": 0,
+      "error_message": "",
+      "output_path": "plans/experiment_blueprint.md",
+      "artifacts": [
+        "plans/experiment_blueprint.md",
+        "plans/experiment_blueprint.json"
+      ],
+      "primary_benchmarks": ["LIBERO-Spatial", "LIBERO-Object", "LIBERO-Goal", "LIBERO-Long", "Simpler-WidowX (incl. Stack-Block)", "Simpler-Google-Robot", "Real-world Piper (4 tasks)", "LIBERO-Plus", "Custom occluded-LIBERO"],
+      "primary_baselines": ["QDepth-VLA", "open-pi-0", "OpenVLA-finetuned", "GST-VLA (read full text first)", "Spatial Forcing (additive)", "GeoVLA (cite)", "3D-CAVLA (cite, upper bound)", "CoT-VLA (cite)"],
+      "compute_estimate": "~188 GPU-h on AutoDL A800 80GB across 4 phases (~1276 RMB, ~19 wallclock days at 2x A800)",
+      "phases": ["P0 Setup (1d, 14 RMB)", "P1 Reproduce QDepth-VLA (2d, 112 RMB)", "P2 +normal +plane (5d, 400 RMB)", "P3 +support w/ derivability (6d, 500 RMB)", "P4 Robustness + figures (5d, 250 RMB)"],
+      "auxiliary_heads": ["depth (K=256, VQ-VAE)", "normal (K=128, VQ-VAE)", "plane (K=64, VQ-VAE)", "support (NxN graph BCE + intermediate contact-patch attention shaped by L_dr only)"],
+      "head_count": 4,
+      "head_count_rationale": "Down from 5 at user signoff. Contact head removed; L_dr derivability constraint on the support head subsumes contact (requires patch existence + plane-alignment + gravity-alignment). Avoids 'module bloat' per user feedback.",
+      "cross_head_losses": ["L_xc cross-geometry consistency (depth-normal orthogonality, plane-normal variance, plane-depth RANSAC residual)", "L_dr derivability — sole source of geometric grounding for the support head; weight raised 0.002 -> 0.003 since it now carries the entire contact signal"]
+    },
+    "SETUP": {
+      "stage": "SETUP",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "CODING": {
+      "stage": "CODING",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "EXECUTION": {
+      "stage": "EXECUTION",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "ANALYSIS": {
+      "stage": "ANALYSIS",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "FIGURE_GEN": {
+      "stage": "FIGURE_GEN",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "WRITING": {
+      "stage": "WRITING",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    },
+    "REVIEW": {
+      "stage": "REVIEW",
+      "status": "pending",
+      "started_at": null,
+      "completed_at": null,
+      "retries": 0,
+      "error_message": "",
+      "output_path": ""
+    }
+  },
+  "artifacts": [
+    {"name": "literature_seed", "path": "papers/literature_seed.md", "stage": "IDEATION", "created_at": "2026-05-11T12:30:00+08:00", "checksum": ""},
+    {"name": "ideation_summary", "path": "plans/ideation_summary.md", "stage": "IDEATION", "created_at": "2026-05-11T12:35:00+08:00", "checksum": ""},
+    {"name": "experiment_blueprint_md", "path": "plans/experiment_blueprint.md", "stage": "PLANNING", "created_at": "2026-05-11T12:46:00+08:00", "checksum": ""},
+    {"name": "experiment_blueprint_json", "path": "plans/experiment_blueprint.json", "stage": "PLANNING", "created_at": "2026-05-11T12:48:00+08:00", "checksum": ""}
+  ],
+  "checkpoints": {
+    "last": "PLANNING_complete",
+    "next": "SETUP_ready",
+    "blocked_on": null,
+    "decisions_locked_at": "2026-05-11T13:08:00+08:00",
+    "decisions_locked": {
+      "name": "GeoRel-VLA",
+      "head_count": 4,
+      "heads": ["depth", "normal", "plane", "support"],
+      "head_simplification_rationale": "Contact head removed (down from 5); L_dr on support head subsumes it. User feedback: avoid module bloat.",
+      "backbone": "open-pi-0",
+      "benchmark_triple": ["LIBERO (4 suites)", "Simpler-WidowX (incl. Stack-Block)", "real Piper (4 tasks)"],
+      "phased_gating": "P1 reproduce QDepth-VLA -> P2 +normal +plane -> P3 +support w/ derivability; explicit go/no-go each",
+      "compute_envelope": {"rmb": 1276, "wallclock_days": 19, "gpu_hours": 188, "hardware": "AutoDL A800 80GB x 2"},
+      "host_mode_continues": true
+    },
+    "resume_via_cli": "nanoresearch resume -w C:/Users/jielu/.nanoresearch/workspace/research/20260511121847e9b8 (after API key configured)",
+    "resume_via_host": "Re-open Claude Code, point at this workspace, request 'continue HOST-mode SETUP for GeoRel-VLA'"
+  },
+  "config_snapshot": {
+    "template_format": "neurips",
+    "execution_profile": "local_quick",
+    "writing_mode": "hybrid",
+    "memory_enabled": true,
+    "skill_evolution_enabled": true,
+    "experiment_conda_env": "vlas",
+    "experiment_python": "D:/Application/Miniconda3/envs/vlas/python.exe"
+  },
+  "notes": "User-provided motivation: current VLA methods rely on 2D image-region attention for visual alignment; the proposed method introduces depth, surface-normal, and plane-structure auxiliary supervision so the policy can explicitly model target-object spatial position, contact, and support relations — boosting robustness under occlusion, in long-horizon multi-step manipulation, and in fine-grained tasks. Pipeline mode = evo, scope = stop after PLANNING for user review. Companion workspace 20260509000456c3a8 (PSSA-VLA) explores a different angle (temporal scene-entity tracking); the present workspace was deliberately created independently per user request, without literature reuse, to allow side-by-side comparison."
+}

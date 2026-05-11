@@ -1,0 +1,26 @@
+# Phase 1 — reproduce QDepth-VLA on LIBERO-Spatial.
+# Goal: prove infra hits 84+ SR (within 2pp of QDepth-VLA paper 86.0).
+
+inherits: default.yaml
+
+heads:
+  depth: { enabled: true }   # only depth this phase
+  normal: { enabled: false }
+  plane: { enabled: false }
+  support: { enabled: false }
+
+losses:
+  cross_consistency: { enabled: false }
+  derivability: { enabled: false }
+
+train:
+  pretrain_epochs_libero90: 20    # match QDepth-VLA recipe
+  finetune_epochs_per_suite: 50
+
+eval:
+  libero_suites: [spatial]        # Phase-1 only Spatial as gating
+  rollouts_per_task: 50
+  seeds: [42]
+
+checkpoint:
+  tag: phase1_qdepth_repro

@@ -1,0 +1,108 @@
+# GeoRel-VLA — base configuration
+# Phase-specific configs (phase1_qdepth_repro / phase2_geo3head / phase3_geo_sup)
+# inherit this and override the head toggles + loss weights.
+
+backbone:
+  name: open-pi-0
+  vlm: google/paligemma-3b-mix-224
+  image_size: 224
+  action_chunk_size: 4   # 4 for sim, 16 for real Piper
+
+heads:
+  depth:
+    enabled: false
+    codebook_size: 256
+    latent_grid: [16, 16]
+    latent_dim: 160
+    expert_layers: 18
+    expert_heads: 8
+    expert_hidden: 1024
+    expert_intermediate: 4096
+    weight_init: 0.01
+    weight_schedule: exp_decay   # gamma=0.9999/step
+  normal:
+    enabled: false
+    codebook_size: 128
+    expert_layers: 18
+    expert_heads: 8
+    expert_hidden: 1024
+    weight_init: 0.01
+    weight_schedule: ramp_up_then_decay   # ramp 0 -> 0.01 over 2 epochs
+  plane:
+    enabled: false
+    codebook_size: 64
+    expert_layers: 18
+    expert_heads: 8
+    expert_hidden: 1024
+    weight_init: 0.01
+    weight_schedule: ramp_up_then_decay
+  support:
+    enabled: false
+    expert_layers: 6
+    expert_heads: 8
+    expert_hidden: 1024
+    max_objects: 8                 # N for NxN adjacency
+    weight_init: 0.005
+    weight_schedule: ramp_up_late  # ramp 0 -> 0.005 over epochs 4-8
+
+losses:
+  cross_consistency:
+    enabled: false
+    weight: 0.002
+    components: [depth_normal_orthogonality, plane_normal_variance, plane_depth_ransac]
+  derivability:
+    enabled: false
+    weight: 0.003
+    components: [contact_patch_existence, plane_aligned_patch, gravity_alignment]
+    contact_distance_threshold_cm: 1.0
+    misalignment_threshold_deg: 15.0
+    vertical_offset_threshold_cm: 2.0
+
+attention_mask: hybrid              # text/image self; geo experts attend image+text;
+                                    # support attends geo+image+proprio; action attends all.
+
+optim:
+  name: adamw
+  lr: 5.0e-5
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  schedule: cosine
+  warmup_steps: 200
+
+train:
+  per_gpu_batch_size: 32
+  effective_global_batch_size: 1024  # via gradient accumulation
+  pretrain_epochs_libero90: 6
+  finetune_epochs_per_suite: 50
+  pretrain_epochs_oxe_fractal: 9     # for Simpler-Google; PhaseN/A on LIBERO-only
+  pretrain_epochs_oxe_bridge: 13     # for Simpler-WidowX
+  fsdp: true
+
+data:
+  primary_sim: libero
+  libero_root: /root/autodl-tmp/LIBERO
+  hf_cache: /root/autodl-tmp/hf
+  oxe_subset: null                   # one of [null, fractal, bridge]
+  pseudo_label_sources:
+    depth: video-depth-anything
+    normal: omnidata-v2
+    plane: region-growing
+  contact_support_extractor:
+    contact_window_ms: 50            # mj_collision aggregation window
+    gravity_axis: -z
+
+eval:
+  libero_suites: []                  # set per-phase
+  rollouts_per_task: 50
+  simpler_widowx_tasks: []
+  simpler_google_tasks: []
+  real_piper_tasks: []
+  real_piper_rollouts: 10
+  occlusion_overlay_pcts: [25, 50, 75]
+  seeds: [42]
+
+checkpoint:
+  out_root: /autodl-fs/data/svla/runs
+  save_every_steps: 5000
+  keep_last: 3

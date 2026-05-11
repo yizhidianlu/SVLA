@@ -1,0 +1,36 @@
+# Phase 3 — add support head with derivability constraint.
+# Goal: answer RQ3 (support helps stacking) and RQ4 (L_dr induces emergent contact).
+
+inherits: default.yaml
+
+heads:
+  depth: { enabled: true }
+  normal: { enabled: true }
+  plane: { enabled: true }
+  support: { enabled: true }
+
+losses:
+  cross_consistency: { enabled: true }
+  derivability: { enabled: true }
+
+train:
+  pretrain_epochs_libero90: 20
+  finetune_epochs_per_suite: 50
+
+eval:
+  libero_suites: [spatial, object, goal, long]
+  rollouts_per_task: 50
+  simpler_widowx_tasks: [carrot, eggplant, spoon, stack-block]
+  simpler_google_tasks: [pick-coke, move-near, drawer, put-apple]
+  real_piper_tasks: [pick-banana, put-chili, put-green-block, stack-green-on-yellow]
+  real_piper_rollouts: 10
+  seeds: [42]
+
+ablations:
+  variants:
+    - {id: geo+sup,         heads: [depth, normal, plane, support], cross_consistency: true,  derivability: true}
+    - {id: geo+sup-no-dr,   heads: [depth, normal, plane, support], cross_consistency: true,  derivability: false}
+    - {id: geo+sup+SF,      heads: [depth, normal, plane, support], cross_consistency: true,  derivability: true,  spatial_forcing_alignment: true}
+
+checkpoint:
+  tag: phase3_geo_sup

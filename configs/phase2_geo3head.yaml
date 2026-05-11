@@ -1,0 +1,34 @@
+# Phase 2 — add normal + plane heads with cross-head consistency.
+# Goal: answer RQ1 (multi-geometry > depth-only) and RQ2 (L_xc helps).
+
+inherits: default.yaml
+
+heads:
+  depth: { enabled: true }
+  normal: { enabled: true }
+  plane: { enabled: true }
+  support: { enabled: false }
+
+losses:
+  cross_consistency: { enabled: true }
+  derivability: { enabled: false }
+
+train:
+  pretrain_epochs_libero90: 20
+  finetune_epochs_per_suite: 50
+
+eval:
+  libero_suites: [spatial, object, goal, long]
+  rollouts_per_task: 50
+  simpler_widowx_tasks: [stack-block]   # anchor for RQ3 in Phase 3
+  seeds: [42]
+
+ablations:
+  variants:
+    - {id: geo-3head,           heads: [depth, normal, plane], cross_consistency: true}
+    - {id: geo-3head-no-xc,     heads: [depth, normal, plane], cross_consistency: false}
+    - {id: geo-3head-no-normal, heads: [depth, plane],         cross_consistency: true}
+    - {id: geo-3head-no-plane,  heads: [depth, normal],        cross_consistency: true}
+
+checkpoint:
+  tag: phase2_geo3head

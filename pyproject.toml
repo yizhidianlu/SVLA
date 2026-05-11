@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "georel_vla"
+version = "0.0.1"
+description = "Geometry-and-Relation-aware Vision-Language-Action model with decoupled depth + normal + plane supervision and derivability-constrained support reasoning."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "GeoRel-VLA contributors" }]
+keywords = [
+    "vision-language-action",
+    "robotic-manipulation",
+    "auxiliary-supervision",
+    "geometry-aware",
+    "support-reasoning",
+]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Runtime deps left intentionally light at scaffold stage; the heavy lifting
+# (torch / transformers / robosuite / mujoco / open-pi-zero) is satisfied by
+# inheriting the pssa-vla conda env on the AutoDL A800. Once the codebase
+# stabilises in CODING stage we will pin exact versions here.
+dependencies = [
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "Pillow>=10.0",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/yizhidianlu/SVLA"
+Issues = "https://github.com/yizhidianlu/SVLA/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
