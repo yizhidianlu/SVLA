@@ -42,7 +42,7 @@ def _set_egl_env() -> None:
     os.environ.setdefault("HF_HOME", "/root/autodl-tmp/hf")
 
 
-_PROPRIO_DIMS_FALLBACK = (3, 4, 1)  # eef pos + eef quat + gripper qpos = 8 dims
+_PROPRIO_DIMS_FALLBACK = (3, 4, 2)  # eef pos + eef quat + parallel-jaw gripper qpos = 9 dims
 
 
 # ----- LIBERO env setup --------------------------------------------------

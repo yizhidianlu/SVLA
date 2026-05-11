@@ -60,7 +60,7 @@ class _LiberoShardDataset:
         depth_clip_m: float = 5.0,
         shuffle_shards: bool = True,
         seed: int = 0,
-        proprio_dim_fallback: int = 8,   # 3 (eef pos) + 4 (eef quat) + 1 (gripper qpos)
+        proprio_dim_fallback: int = 9,   # 3 (eef pos) + 4 (eef quat) + 2 (parallel-jaw gripper qpos)
     ) -> None:
         self.data_dir = Path(data_dir)
         self.depth_clip_m = depth_clip_m
