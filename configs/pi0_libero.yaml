@@ -1,0 +1,123 @@
+# open-pi-zero PiZero model configuration for LIBERO (action_dim=7, proprio_dim=7).
+#
+# This is the **architecture-only** subset of open-pi-zero's bridge.yaml — we
+# strip the data / wandb / lr-scheduler / training-loop fields because
+# Pi0Backbone instantiates PiZero directly and our own train.py owns the
+# training loop. Action / proprio dims for LIBERO match Bridge's defaults
+# (7 each), so the only meaningful change vs `third_party/open-pi-zero/
+# config/train/bridge.yaml` is the deletion of the unused fields.
+#
+# Resolved Hydra `_target_` strings refer to modules in the open-pi-zero
+# submodule's `src.*` namespace; ensure
+# `third_party/open-pi-zero` is on PYTHONPATH (Pi0Backbone.add_third_party_to_syspath).
+
+device: cuda
+seed: 42
+use_bf16: True
+use_amp: True
+quantize: False
+lora: False
+lora_r: 32
+lora_dropout: 0.0
+debug: False
+
+flow_sampling: beta
+num_inference_steps: 10
+final_action_clip_value: 1.0  # data normalised in [-1, 1]
+
+cond_steps: 1
+horizon_steps: 4
+action_dim: 7        # LIBERO end-effector control = 6 delta-pose + 1 gripper
+proprio_dim: 7       # LIBERO end-effector pose (xyz + rpy + gripper)
+max_seq_len: 276     # 256 image tokens + max 20 text tokens
+max_image_text_tokens: ${max_seq_len}
+tokenizer_padding: max_length
+
+action_expert_adaptive_mode:    # adaLN, adaLN-Zero, or null
+action_expert_rope_theta: 100.0
+
+mixture:
+  vlm:                           # Gemma 2B
+    hidden_size: 2048
+    intermediate_size: 16384
+    use_final_norm: False
+    cache: True
+    use_quantize: ${quantize}
+    use_lora: ${lora}
+    adaptive_mode:
+    rope_theta: 10000.0
+  proprio:
+    hidden_size: 1024
+    intermediate_size: 4096
+    use_final_norm: True
+    cache: True
+    use_quantize: False
+    use_lora: False
+    adaptive_mode: ${action_expert_adaptive_mode}
+    rope_theta: ${action_expert_rope_theta}
+  action:
+    hidden_size: 1024
+    intermediate_size: 4096
+    use_final_norm: True
+    cache: False
+    use_quantize: False
+    use_lora: False
+    adaptive_mode: ${action_expert_adaptive_mode}
+    rope_theta: ${action_expert_rope_theta}
+
+time_hidden_size: 256
+time_max_period: 100.0
+
+# fixed PaliGemma values
+image_token_index: 257152
+vocab_size: 257216
+pad_token_id: 0
+
+vision:
+  _target_: src.model.paligemma.siglip.SiglipVisionModel
+  config:
+    hidden_size: 1152               # SigLIP-So400m
+    intermediate_size: 4304
+    num_hidden_layers: 27
+    num_attention_heads: 16
+    num_channels: 3
+    image_size: 224
+    patch_size: 14
+    layer_norm_eps: 1e-6
+    attention_dropout: 0.0
+    num_image_tokens: 256
+    lora:
+      r: ${lora_r}
+      dropout: ${lora_dropout}
+  use_quantize: ${quantize}
+  use_lora: ${lora}
+
+vision_projector:
+  _target_: src.model.paligemma.siglip.PaliGemmaMultiModalProjector
+  config:
+    vision_config:
+      hidden_size: 1152
+      projection_dim: 2048
+    lora:
+      r: ${lora_r}
+      dropout: ${lora_dropout}
+  use_quantize: ${quantize}
+  use_lora: ${lora}
+
+joint:
+  _target_: src.model.vla.joint_model.JointModel
+  config:
+    action_expert_adaptive_mode: ${action_expert_adaptive_mode}
+    time_hidden_size: ${time_hidden_size}
+    mixture: ${mixture}
+    lora:
+      r: ${lora_r}
+      dropout: ${lora_dropout}
+    num_hidden_layers: 18
+    num_attention_heads: 8
+    num_key_value_heads: 1
+    head_dim: 256
+    rms_norm_eps: 1e-6
+    attention_bias: False
+    attention_dropout: 0.0
+    pad_token_id: ${pad_token_id}

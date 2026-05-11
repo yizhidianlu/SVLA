@@ -48,14 +48,60 @@ def test_backbone_describe_works_without_load() -> None:
     assert info["loaded"] is False
 
 
-def test_backbone_load_raises_until_phase1_6() -> None:
-    """Phase 1.6 will replace this contract; until then the wrapper signals
-    'not yet wired' via NotImplementedError."""
+def test_backbone_load_signals_missing_submodule_when_absent() -> None:
+    """If the submodule isn't initialised (CI checkout w/o --recursive),
+    `load()` should raise a clear RuntimeError rather than crashing
+    half-instantiated. Phase 1.7a wired the real instantiation path."""
     import pytest as _pytest
 
-    from georel_vla.backbones.pi0 import Pi0Backbone
-    with _pytest.raises(NotImplementedError):
+    from georel_vla.backbones.pi0 import Pi0Backbone, is_available
+    if is_available():
+        _pytest.skip("submodule + deps available — covered by test_pi0_load_real")
+    with _pytest.raises(RuntimeError, match="submodule not initialised"):
         Pi0Backbone().load()
+
+
+def test_pi0_load_real_instantiates() -> None:
+    """When open-pi-zero is fully installed (remote `geo-rel-vla` env), the
+    real `load()` path stands up the model. Skipped elsewhere."""
+    import pytest as _pytest
+
+    from georel_vla.backbones.pi0 import Pi0Backbone, Pi0BackboneConfig, is_available
+    if not is_available():
+        _pytest.skip("open-pi-zero submodule + deps not available")
+    try:
+        import omegaconf  # noqa: F401
+    except ImportError:
+        _pytest.skip("omegaconf not installed (open-pi-zero install incomplete)")
+
+    bk = Pi0Backbone(Pi0BackboneConfig(
+        device="cpu", dtype="fp32", load_paligemma=False,
+    ))
+    bk.load()
+    info = bk.describe()
+    assert info["loaded"] is True
+    assert info["n_params"] > 3_000_000_000, f"PiZero too small: {info['n_params']}"
+
+
+def test_pi0_encode_image_to_siglip_shape() -> None:
+    """Real forward through SigLIP — verifies (B, 256, 1152) contract."""
+    import pytest as _pytest
+
+    from georel_vla.backbones.pi0 import Pi0Backbone, Pi0BackboneConfig, is_available
+    if not is_available():
+        _pytest.skip("open-pi-zero submodule + deps not available")
+    try:
+        import omegaconf  # noqa: F401
+    except ImportError:
+        _pytest.skip("omegaconf not installed (open-pi-zero install incomplete)")
+
+    import torch
+    bk = Pi0Backbone(Pi0BackboneConfig(
+        device="cpu", dtype="fp32", load_paligemma=False,
+    ))
+    bk.load()
+    out = bk.encode_image_to_siglip(torch.randn(1, 3, 224, 224))
+    assert out.shape == (1, 256, 1152), out.shape
 
 
 def test_submodule_pinned_on_disk() -> None:

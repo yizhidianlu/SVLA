@@ -1,39 +1,25 @@
-"""Thin wrapper around open-pi-zero's PiZero (`third_party/open-pi-zero`).
+"""Real `Pi0Backbone` — wraps open-pi-zero's PiZero (`third_party/open-pi-zero`).
 
-Status (Phase 1.3, 2026-05-11)
-    * `third_party/open-pi-zero` is pinned via git submodule.
-    * This module declares the *interface* that GeoRel-VLA's depth expert and
-      model.py expect from the backbone (load + forward + SigLIP-feature
-      extraction hook), with a working `is_available()` probe.
-    * Methods that require the actual upstream `PiZero` instance raise
-      NotImplementedError — they are filled in during Phase 1.6 (model.py
-      wiring), once we have a Hydra config that selects a concrete checkpoint.
+Phase 1.7a: `load()` and `encode_image_to_siglip()` are now wired. The
+checkpoint loader is best-effort (skipped if PaliGemma weights aren't on
+disk yet — the depth expert can train on top of random-init SigLIP, which
+matches QDepth-VLA's recipe of "VLM is fine-tuned during VLA training").
 
-Why this split
-    open-pi-zero instantiates PiZero from a heavy Hydra config (PaliGemma 3B
-    VLM + ~0.3B action expert + flow-matching action head). Standing up that
-    config the same time as we land the VQ-VAE / depth expert / loss module
-    would make the diff unreviewable. By cleanly separating "interface" and
-    "implementation" here, the depth expert + loss work can be unit-tested
-    against a small stub today, and the real wiring is a self-contained
-    change in Phase 1.6.
+Architecture surface exposed to the rest of GeoRel-VLA:
+    * `siglip_dim = 1152`, `n_image_tokens = 256` (PaliGemma-3B / SigLIP-So400m)
+    * `encode_image_to_siglip(rgb) -> (B, 256, 1152)`           — what depth expert eats
+    * `forward_action(...)` (Phase 1.7c) — CFM action head call
 
-Integration plan (Phase 1.6)
-    1. Pick a base config from `third_party/open-pi-zero/config/` (likely
-       `train/pg_oxe.yaml` then specialise for LIBERO via overrides).
-    2. Resolve via `hydra.utils.instantiate(cfg)` and load the published
-       checkpoint from `allenzren/open-pi-zero` on HuggingFace.
-    3. Surface the SigLIP image features by hooking into PiZero's
-       `joint_model.vlm` — we need the 256 visual tokens *before* language
-       fusion so they can feed the depth expert (per QDepth-VLA §3.3
-       "depth expert takes the visual embeddings from the SigLIP encoder ...
-       before language fusion to avoid semantic interference").
-    4. Replace the NotImplementedError stubs below with the real glue.
+Submodule layout assumption: `third_party/open-pi-zero/src/model/vla/pizero.py`
+exists; the wrapper inserts `third_party/open-pi-zero/` on sys.path because
+the upstream uses `from src.model... import ...` absolute imports.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,14 +30,26 @@ from torch import nn
 
 from .base import VLABackbone
 
+log = logging.getLogger(__name__)
+
 THIRD_PARTY_OPEN_PI_ZERO = Path(__file__).resolve().parents[3] / "third_party" / "open-pi-zero"
+
+#: Default LIBERO model config that ships with this repo (configs/pi0_libero.yaml).
+DEFAULT_CONFIG_PATH = (
+    Path(__file__).resolve().parents[3] / "configs" / "pi0_libero.yaml"
+)
+
+#: Where open-pi-zero's README expects PaliGemma weights:
+#:     `${TRANSFORMERS_CACHE}/paligemma-3b-pt-224`
+#: With our `HF_HOME=/root/autodl-tmp/hf` convention this becomes
+#:     `/root/autodl-tmp/hf/paligemma-3b-pt-224`.
+DEFAULT_PALIGEMMA_DIR_NAME = "paligemma-3b-pt-224"
 
 
 def is_available() -> bool:
     """Return True if open-pi-zero submodule + its python deps can be imported."""
     if not (THIRD_PARTY_OPEN_PI_ZERO / "src" / "model" / "vla" / "pizero.py").is_file():
         return False
-    # Ensure the submodule's src/ is on sys.path so `from src.model.vla.pizero import PiZero` works.
     add_third_party_to_syspath()
     try:
         spec = importlib.util.find_spec("src.model.vla.pizero")
@@ -61,11 +59,7 @@ def is_available() -> bool:
 
 
 def add_third_party_to_syspath() -> None:
-    """Idempotently insert `third_party/open-pi-zero/` at sys.path[0].
-
-    open-pi-zero uses `from src.model... import ...` absolute imports, so its
-    repo root (not the `src/` dir) needs to be on sys.path.
-    """
+    """Idempotently insert `third_party/open-pi-zero/` at sys.path[0]."""
     p = str(THIRD_PARTY_OPEN_PI_ZERO)
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -73,22 +67,19 @@ def add_third_party_to_syspath() -> None:
 
 @dataclass
 class Pi0BackboneConfig:
-    """Light config for the wrapper; the real PiZero Hydra config arrives in Phase 1.6."""
+    """Wrapper-level config — distinct from the deep PiZero Hydra config."""
 
-    config_path: str | None = None          # e.g., "config/train/pg_oxe.yaml" relative to submodule
-    config_name: str | None = None          # for Hydra overrides
-    checkpoint: str | None = None           # "allenzren/open-pi-zero" or local path
+    config_path: Path | None = None         # defaults to DEFAULT_CONFIG_PATH
+    paligemma_dir: Path | None = None       # default = $TRANSFORMERS_CACHE/paligemma-3b-pt-224
+    load_paligemma: bool = True             # if False, leave SigLIP / Gemma random-init
     device: str = "cuda"
-    dtype: str = "bf16"
-    image_size: int = 224                   # SigLIP input
-    expose_siglip_features: bool = True     # whether forward() also returns pre-fusion image tokens
+    dtype: str = "bf16"                     # `bf16` | `fp16` | `fp32`
+    image_size: int = 224
+    expose_siglip_features: bool = True
 
 
 class Pi0Backbone(VLABackbone):
-    """Adapter exposing the slice of open-pi-zero our model.py + depth expert need.
-
-    Phase 1.7 will replace the stubs with calls into `third_party/open-pi-zero`.
-    """
+    """Wraps open-pi-zero PiZero; exposes the slice GeoRelVLA + DepthExpert need."""
 
     siglip_dim: int = 1152
     n_image_tokens: int = 256
@@ -96,27 +87,101 @@ class Pi0Backbone(VLABackbone):
     def __init__(self, cfg: Pi0BackboneConfig | None = None) -> None:
         super().__init__()
         self.cfg = cfg or Pi0BackboneConfig()
-        self._pizero: nn.Module | None = None  # populated in load()
+        self._pizero: nn.Module | None = None
+        self._pizero_cfg: Any = None
 
     # -- lifecycle ---------------------------------------------------------
 
     def load(self) -> None:
-        """Instantiate the upstream PiZero and load the checkpoint.
+        """Instantiate the upstream PiZero and (best-effort) load PaliGemma."""
+        if self._pizero is not None:
+            return  # idempotent
 
-        Filled in Phase 1.7 — needs the Hydra config wiring.
+        if not is_available():
+            raise RuntimeError(
+                f"open-pi-zero submodule not initialised at {THIRD_PARTY_OPEN_PI_ZERO}. "
+                f"Run `git submodule update --init --recursive` and `pip install --no-deps -e "
+                f"{THIRD_PARTY_OPEN_PI_ZERO}` plus `pip install hydra-core omegaconf einops`."
+            )
+
+        from omegaconf import OmegaConf
+
+        cfg_path = self.cfg.config_path or DEFAULT_CONFIG_PATH
+        if not cfg_path.is_file():
+            raise FileNotFoundError(f"PiZero config not found: {cfg_path}")
+        pi_cfg = OmegaConf.load(cfg_path)
+        OmegaConf.resolve(pi_cfg)
+
+        from src.model.vla.pizero import PiZero
+
+        log.info("Pi0Backbone: instantiating PiZero from %s", cfg_path)
+        pizero = PiZero(pi_cfg)
+        self._pizero = pizero
+        self._pizero_cfg = pi_cfg
+
+        if self.cfg.load_paligemma:
+            self._best_effort_load_paligemma()
+
+        # Move to requested device + dtype.
+        target_dtype = self._resolve_dtype(self.cfg.dtype)
+        self._pizero = self._pizero.to(device=self.cfg.device, dtype=target_dtype)
+
+    def _resolve_dtype(self, name: str) -> torch.dtype:
+        return {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+        }.get(name, torch.float32)
+
+    def _best_effort_load_paligemma(self) -> None:
+        """Load PaliGemma vision + LM weights into vision_tower / joint_model.vlm.
+
+        Skipped (with a warning) if the PaliGemma snapshot directory is not
+        on disk — random-init SigLIP / Gemma is acceptable for the depth
+        expert smoke + early Phase-1.7 development; Phase 1.7c will require
+        real weights for the action-loss to converge.
         """
-        raise NotImplementedError("Phase 1.7 — see docstring at the top of this file.")
+        cache = os.environ.get("TRANSFORMERS_CACHE") or os.environ.get("HF_HOME") or ""
+        pal_dir = self.cfg.paligemma_dir or (Path(cache) / DEFAULT_PALIGEMMA_DIR_NAME)
+        if not pal_dir.is_dir():
+            log.warning(
+                "PaliGemma directory not found at %s — leaving SigLIP / Gemma "
+                "random-init. Run `cd %s && git clone https://huggingface.co/google/paligemma-3b-pt-224` "
+                "(or set Pi0BackboneConfig.paligemma_dir) before Phase-1.7c training.",
+                pal_dir, cache or "<TRANSFORMERS_CACHE>",
+            )
+            return
 
-    # -- forward hooks the depth expert + model.py call -------------------
+        log.info("Pi0Backbone: loading PaliGemma weights from %s", pal_dir)
+        try:
+            self._pizero.load_pretrained_weights(str(pal_dir))  # upstream method
+        except AttributeError:
+            # Older open-pi-zero releases used a free function — try it.
+            try:
+                from src.model.vla.utils import load_paligemma_weights
+                load_paligemma_weights(self._pizero, str(pal_dir))
+            except Exception as exc:
+                log.warning("PaliGemma load helper not found (%s); leaving random-init", exc)
+
+    # -- forward hooks ----------------------------------------------------
 
     def encode_image_to_siglip(self, rgb: torch.Tensor) -> torch.Tensor:
-        """(B, 3, H, W) RGB -> (B, n_tokens, siglip_dim) pre-fusion visual tokens.
-
-        This is the slice that gets fed into the depth expert per
-        QDepth-VLA §3.3 "before language fusion to avoid semantic
-        interference". Phase 1.7 wires this through PiZero's SigLIP module.
-        """
-        raise NotImplementedError("Phase 1.7 — hooks into joint_model.vlm SigLIP.")
+        """(B, 3, H, W) RGB -> (B, 256, 1152) pre-fusion SigLIP features."""
+        if self._pizero is None:
+            raise RuntimeError("Pi0Backbone.load() must be called before forward")
+        if rgb.ndim != 4 or rgb.size(1) != 3:
+            raise ValueError(f"expected (B, 3, H, W); got {tuple(rgb.shape)}")
+        # Match the dtype the backbone is in (bf16 by default).
+        target_param = next(self._pizero.vision_tower.parameters())
+        x = rgb.to(device=target_param.device, dtype=target_param.dtype)
+        out = self._pizero.vision_tower(x)
+        # SiglipVisionModel.forward returns (B, num_image_tokens, hidden_size).
+        if out.ndim != 3 or out.size(1) != self.n_image_tokens or out.size(2) != self.siglip_dim:
+            raise RuntimeError(
+                f"SigLIP output shape {tuple(out.shape)} does not match "
+                f"(B, {self.n_image_tokens}, {self.siglip_dim})"
+            )
+        return out
 
     def forward_action(
         self,
@@ -124,26 +189,31 @@ class Pi0Backbone(VLABackbone):
         language_tokens: torch.Tensor,
         proprio: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Standard PiZero forward returning (action_chunk, aux_dict).
-
-        Phase 1.7 wires through PiZero.forward / .generate_actions.
-        `aux_dict` will surface intermediates (SigLIP features, hybrid-attn
-        layout) that the depth expert and the cross-head consistency loss
-        in Phase 2 will consume.
-        """
-        raise NotImplementedError("Phase 1.7 — calls PiZero.forward.")
+        """Standard PiZero action head. Filled in Phase 1.7c."""
+        raise NotImplementedError("Phase 1.7c — calls PiZero.forward / .infer_action.")
 
     # -- introspection ----------------------------------------------------
-    # siglip_dim / n_image_tokens are defined as class attrs above (matching
-    # the VLABackbone interface).
+
+    @property
+    def pizero(self) -> nn.Module | None:
+        """Expose the wrapped PiZero instance for downstream modules in 1.7c."""
+        return self._pizero
 
     def describe(self) -> dict[str, Any]:
+        n_params = (
+            sum(p.numel() for p in self._pizero.parameters()) if self._pizero is not None else 0
+        )
         return {
             "submodule_path": str(THIRD_PARTY_OPEN_PI_ZERO),
             "submodule_available": is_available(),
             "config": self.cfg.__dict__,
             "loaded": self._pizero is not None,
+            "n_params": n_params,
         }
 
 
-__all__ = ["Pi0Backbone", "Pi0BackboneConfig", "is_available", "add_third_party_to_syspath"]
+__all__ = [
+    "Pi0Backbone", "Pi0BackboneConfig",
+    "is_available", "add_third_party_to_syspath",
+    "DEFAULT_CONFIG_PATH", "DEFAULT_PALIGEMMA_DIR_NAME",
+]
