@@ -121,7 +121,14 @@ class LiberoDepthExtractor:
             yield from self.extract_task(suite, tid)
 
     def extract_task(self, suite: str, task_id: int) -> Iterator[Path]:
-        """Yield npz path for every demo in `<suite>/<task>_demo.hdf5`."""
+        """Yield npz path for every demo in `<suite>/<task>_demo.hdf5`.
+
+        PSSA-documented infra fix: instantiate the Robosuite env **once per
+        task** and reset between demos instead of recreating per demo. The
+        per-demo `OffScreenRenderEnv` recreation leaks EGL render contexts
+        (each new render context = 1+ open fds) and the process hangs ~10
+        demos in when the EGL pool / fd table is exhausted.
+        """
         import h5py
 
         bench = self._load_benchmark(suite)
@@ -140,25 +147,39 @@ class LiberoDepthExtractor:
 
             init_states = bench.get_task_init_states(task_id)
 
-            for demo_idx, demo_key in enumerate(demo_keys):
-                out_path = out_dir / f"task{task_id:02d}_{demo_key}.npz"
-                if self.cfg.skip_existing and out_path.is_file():
-                    log.info("skip (exists): %s", out_path.name)
-                    yield out_path
-                    continue
+            # Decide first if there is any work left, to skip the (slow)
+            # env construction when every demo is already on disk.
+            todo = [
+                k for k in demo_keys
+                if not (self.cfg.skip_existing and (out_dir / f"task{task_id:02d}_{k}.npz").is_file())
+            ]
+            for k in demo_keys:
+                if k not in todo:
+                    yield out_dir / f"task{task_id:02d}_{k}.npz"
+            if not todo:
+                return
 
-                frames = list(
-                    self._replay_demo_inner(
-                        suite, task, task_id, demo_idx, demo_key,
+            env = self._make_env(suite, task)
+            try:
+                for demo_key in todo:
+                    demo_idx = demo_keys.index(demo_key)
+                    out_path = out_dir / f"task{task_id:02d}_{demo_key}.npz"
+
+                    frames = list(self._replay_one_demo_in_env(
+                        env, task_id, demo_idx,
                         init_states, demo_actions=f["data"][demo_key]["actions"][:],
-                    )
-                )
-                if not frames:
-                    log.warning("no frames produced for %s demo %s", suite, demo_key)
-                    continue
+                    ))
+                    if not frames:
+                        log.warning("no frames produced for %s demo %s", suite, demo_key)
+                        continue
 
-                self._save_npz(out_path, suite, task, task_id, frames)
-                yield out_path
+                    self._save_npz(out_path, suite, task, task_id, frames)
+                    yield out_path
+            finally:
+                try:
+                    env.close()
+                except Exception as exc:  # pragma: no cover
+                    log.warning("env.close() raised %s — ignoring", exc)
 
     def replay_demo(
         self,
@@ -166,7 +187,10 @@ class LiberoDepthExtractor:
         task_id: int,
         demo_idx: int = 0,
     ) -> Iterator[LiberoFrame]:
-        """Yield per-step LiberoFrame for `(suite, task_id, demo_idx)`. No disk IO."""
+        """Yield per-step LiberoFrame for `(suite, task_id, demo_idx)`. No disk IO.
+
+        Single-demo convenience path; creates + closes its own env.
+        """
         import h5py
 
         bench = self._load_benchmark(suite)
@@ -178,10 +202,17 @@ class LiberoDepthExtractor:
                 raise IndexError(f"demo_idx {demo_idx} >= {len(demo_keys)} demos")
             demo_key = demo_keys[demo_idx]
             init_states = bench.get_task_init_states(task_id)
-            yield from self._replay_demo_inner(
-                suite, task, task_id, demo_idx, demo_key, init_states,
-                demo_actions=f["data"][demo_key]["actions"][:],
-            )
+            env = self._make_env(suite, task)
+            try:
+                yield from self._replay_one_demo_in_env(
+                    env, task_id, demo_idx, init_states,
+                    demo_actions=f["data"][demo_key]["actions"][:],
+                )
+            finally:
+                try:
+                    env.close()
+                except Exception as exc:  # pragma: no cover
+                    log.warning("env.close() raised %s — ignoring", exc)
 
     # --- internals --------------------------------------------------------
 
@@ -221,54 +252,44 @@ class LiberoDepthExtractor:
         env.seed(self.cfg.seed)
         return env
 
-    def _replay_demo_inner(
+    def _replay_one_demo_in_env(
         self,
-        suite: str,
-        task,
+        env,
         task_id: int,
         demo_idx: int,
-        demo_key: str,
         init_states,
         demo_actions,
     ) -> Iterator[LiberoFrame]:
+        """Replay one demo inside a *shared* env (do NOT close env here)."""
         import numpy as np
         from robosuite.utils import camera_utils
 
-        env = self._make_env(suite, task)
-        try:
-            env.reset()
-            env.set_init_state(init_states[demo_idx])
-            # NOTE: take the sim handle AFTER env.reset() / set_init_state.
-            # LIBERO/Robosuite re-instantiate the underlying MjSim on reset, so a
-            # reference captured before reset would be stale and `.model` unbound
-            # at first use ("'MjSim' object has no attribute 'model'").
-            sim = getattr(env, "sim", None) or getattr(getattr(env, "env", None), "sim", None)
-            if self.cfg.metric_depth and sim is None:
-                raise RuntimeError(
-                    "metric_depth=True requires a MuJoCo sim handle (env.sim or env.env.sim)"
-                )
+        env.reset()
+        env.set_init_state(init_states[demo_idx])
+        # NOTE: take the sim handle AFTER env.reset() / set_init_state.
+        # LIBERO/Robosuite re-instantiate the underlying MjSim on reset, so a
+        # reference captured before reset would be stale and `.model` unbound
+        # at first use ("'MjSim' object has no attribute 'model'").
+        sim = getattr(env, "sim", None) or getattr(getattr(env, "env", None), "sim", None)
+        if self.cfg.metric_depth and sim is None:
+            raise RuntimeError(
+                "metric_depth=True requires a MuJoCo sim handle (env.sim or env.env.sim)"
+            )
 
-            n_steps = min(int(len(demo_actions)), int(self.cfg.max_steps_per_demo))
-            for t in range(n_steps):
-                action = np.asarray(demo_actions[t], dtype=np.float32)
-                obs, _, _, _ = env.step(action)
-                if t % self.cfg.stride != 0:
-                    continue
-                rgb = np.asarray(obs[f"{self.cfg.camera}_image"], dtype=np.uint8)
-                depth = np.asarray(obs[f"{self.cfg.camera}_depth"], dtype=np.float32)
-                # depth shape may be (H, W, 1); squeeze to (H, W)
-                if depth.ndim == 3 and depth.shape[-1] == 1:
-                    depth = depth[..., 0]
-                if self.cfg.metric_depth:
-                    # OpenGL z-buffer (non-linear, [0,1]) -> metric depth (meters).
-                    depth = camera_utils.get_real_depth_map(sim, depth.astype(np.float32))
-                    np.clip(depth, 0.0, self.cfg.depth_clip_m, out=depth)
-                yield LiberoFrame(rgb=rgb, depth=depth, action=action, step=t)
-        finally:
-            try:
-                env.close()
-            except Exception as exc:  # pragma: no cover
-                log.warning("env.close() raised %s — ignoring", exc)
+        n_steps = min(int(len(demo_actions)), int(self.cfg.max_steps_per_demo))
+        for t in range(n_steps):
+            action = np.asarray(demo_actions[t], dtype=np.float32)
+            obs, _, _, _ = env.step(action)
+            if t % self.cfg.stride != 0:
+                continue
+            rgb = np.asarray(obs[f"{self.cfg.camera}_image"], dtype=np.uint8)
+            depth = np.asarray(obs[f"{self.cfg.camera}_depth"], dtype=np.float32)
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            if self.cfg.metric_depth:
+                depth = camera_utils.get_real_depth_map(sim, depth.astype(np.float32))
+                np.clip(depth, 0.0, self.cfg.depth_clip_m, out=depth)
+            yield LiberoFrame(rgb=rgb, depth=depth, action=action, step=t)
 
     def _save_npz(
         self,
