@@ -28,7 +28,9 @@ final_action_clip_value: 1.0  # data normalised in [-1, 1]
 cond_steps: 1
 horizon_steps: 4
 action_dim: 7        # LIBERO end-effector control = 6 delta-pose + 1 gripper
-proprio_dim: 7       # LIBERO end-effector pose (xyz + rpy + gripper)
+proprio_dim: 9       # LIBERO obs: robot0_eef_pos (3) + robot0_eef_quat (4) + robot0_gripper_qpos (2)
+                     #   — quat (not euler) and parallel-jaw gripper (2 fingers) differ from
+                     #   bridge.yaml's POS_EULER 7-dim convention
 max_seq_len: 276     # 256 image tokens + max 20 text tokens
 max_image_text_tokens: ${max_seq_len}
 tokenizer_padding: max_length
