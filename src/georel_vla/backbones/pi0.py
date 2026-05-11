@@ -89,6 +89,8 @@ class Pi0Backbone(VLABackbone):
         self.cfg = cfg or Pi0BackboneConfig()
         self._pizero: nn.Module | None = None
         self._pizero_cfg: Any = None
+        self._tokenizer: Any = None
+        self._processor: Any = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -121,6 +123,12 @@ class Pi0Backbone(VLABackbone):
 
         if self.cfg.load_paligemma:
             self._best_effort_load_paligemma()
+
+        # Init the VLAProcessor + PaliGemma tokenizer for forward_action_loss /
+        # infer_action; both the train and inference paths need them. They depend
+        # on `pretrained_model_path` so do this AFTER _best_effort_load_paligemma()
+        # has set it on the OmegaConf cfg.
+        self._init_processor()
 
         # Move to requested device + dtype.
         target_dtype = self._resolve_dtype(self.cfg.dtype)
@@ -187,14 +195,128 @@ class Pi0Backbone(VLABackbone):
             )
         return out
 
-    def forward_action(
+    def _init_processor(self) -> None:
+        """Lazy-init the VLAProcessor + PaliGemma tokenizer."""
+        if self._processor is not None:
+            return
+        from transformers import AutoTokenizer
+
+        add_third_party_to_syspath()
+        from src.model.vla.processing import VLAProcessor
+
+        pal_path = getattr(self._pizero.cfg, "pretrained_model_path", None)
+        if not pal_path:
+            log.warning("PiZero.cfg.pretrained_model_path is empty — VLAProcessor "
+                        "tokenizer will fall back to the default PaliGemma tokenizer "
+                        "via TRANSFORMERS_CACHE; train/inference may misbehave if "
+                        "the actual weights weren't downloaded.")
+            pal_path = (
+                self.cfg.paligemma_dir
+                or (Path(os.environ.get("TRANSFORMERS_CACHE", "")) / DEFAULT_PALIGEMMA_DIR_NAME)
+            )
+        self._tokenizer = AutoTokenizer.from_pretrained(str(pal_path), padding_side="right")
+        self._processor = VLAProcessor(
+            self._tokenizer,
+            num_image_tokens=self._pizero.cfg.vision.config.num_image_tokens,
+            max_seq_len=self._pizero.cfg.max_seq_len,
+            tokenizer_padding=self._pizero.cfg.tokenizer_padding,
+        )
+
+    def _build_inputs(
         self,
-        rgb: torch.Tensor,
-        language_tokens: torch.Tensor,
-        proprio: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Standard PiZero action head. Filled in Phase 1.7c."""
-        raise NotImplementedError("Phase 1.7c — calls PiZero.forward / .infer_action.")
+        rgb_uint8: torch.Tensor,
+        language: list[str],
+        proprios: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Tokenise (rgb, language) + derive PiZero's per-modality masks/positions.
+
+        Args
+            rgb_uint8 : (B, 3, H, W) uint8 image tensor (VLAProcessor rescales)
+            language  : list of B prompt strings
+            proprios  : (B, cond_steps, proprio_dim) float — end-effector pose history
+
+        Returns kwargs dict ready to splat into PiZero.forward / .infer_action_naive.
+        """
+        if rgb_uint8.dtype != torch.uint8:
+            raise ValueError(
+                f"VLAProcessor expects uint8 RGB; got {rgb_uint8.dtype}. "
+                f"Convert via `(rgb * 255).to(torch.uint8)` before calling."
+            )
+
+        target_dtype = self._resolve_dtype(self.cfg.dtype)
+        device = self.cfg.device
+
+        out = self._processor(text=language, images=rgb_uint8.cpu())
+        causal_mask, vlm_pos, prop_pos, act_pos = self._pizero.build_causal_mask_and_position_ids(
+            out["attention_mask"], dtype=target_dtype,
+        )
+        return {
+            "input_ids": out["input_ids"].to(device),
+            "pixel_values": out["pixel_values"].to(device=device, dtype=target_dtype),
+            "causal_mask": causal_mask.to(device),
+            "vlm_position_ids": vlm_pos.to(device),
+            "proprio_position_ids": prop_pos.to(device),
+            "action_position_ids": act_pos.to(device),
+            "proprios": proprios.to(device=device, dtype=target_dtype),
+        }
+
+    def forward_action_loss(
+        self,
+        rgb_uint8: torch.Tensor,
+        language: list[str],
+        proprios: torch.Tensor,
+        actions: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """π₀ flow-matching action loss.
+
+        Args
+            rgb_uint8 : (B, 3, H, W) uint8 RGB
+            language  : list of B prompt strings
+            proprios  : (B, cond_steps, proprio_dim) float
+            actions   : (B, horizon_steps, action_dim) float — target action chunk
+            t         : (B,) flow-matching timestep in (0, 1)
+
+        Returns scalar loss tensor.
+        """
+        if self._pizero is None:
+            raise RuntimeError("Pi0Backbone.load() must be called before forward_action_loss")
+        target_dtype = self._resolve_dtype(self.cfg.dtype)
+        inputs = self._build_inputs(rgb_uint8, language, proprios)
+        inputs["actions"] = actions.to(device=self.cfg.device, dtype=target_dtype)
+        inputs["t"] = t.to(device=self.cfg.device, dtype=target_dtype)
+        return self._pizero(**inputs)
+
+    @torch.no_grad()
+    def infer_action(
+        self,
+        rgb_uint8: torch.Tensor,
+        language: list[str],
+        proprios: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample action chunk via PiZero.infer_action_naive flow matching integration.
+
+        Returns (B, horizon_steps, action_dim) float tensor.
+        """
+        if self._pizero is None:
+            raise RuntimeError("Pi0Backbone.load() must be called before infer_action")
+        was_training = self._pizero.training
+        self._pizero.eval()
+        try:
+            inputs = self._build_inputs(rgb_uint8, language, proprios)
+            actions = self._pizero.infer_action_naive(**inputs)
+        finally:
+            self._pizero.train(was_training)
+        return actions
+
+    # legacy stub name: keep for backward compat with the GeoRelVLA wiring
+    def forward_action(self, *args, **kwargs):
+        """Deprecated — use forward_action_loss (training) or infer_action (eval) directly."""
+        raise NotImplementedError(
+            "Pi0Backbone now exposes forward_action_loss(rgb, language, proprios, actions, t) "
+            "and infer_action(rgb, language, proprios). The single-call forward_action(...) "
+            "stub was retired in Phase 1.7c.2."
+        )
 
     # -- introspection ----------------------------------------------------
 
