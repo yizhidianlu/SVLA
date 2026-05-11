@@ -291,10 +291,21 @@ class VQVAE(nn.Module):
         return self.decoder(z_q)
 
     def encode_indices(self, x: torch.Tensor) -> torch.Tensor:
-        """Return (B, H, W) discrete code indices for `x`. Used as supervision target."""
-        z_e = self.encode(x)
-        with torch.no_grad():
-            _, indices, _ = self.quantizer(z_e)
+        """Return (B, H, W) discrete code indices for `x`.
+
+        Used as the depth-CE supervision target. **Never** updates the EMA
+        codebook — semantically a lookup, not a training step. Forces the
+        quantiser to eval mode for the call so EMA accumulators stay frozen
+        even if the parent module is in training mode.
+        """
+        was_training = self.quantizer.training
+        self.quantizer.eval()
+        try:
+            z_e = self.encode(x)
+            with torch.no_grad():
+                _, indices, _ = self.quantizer(z_e)
+        finally:
+            self.quantizer.train(was_training)
         return indices
 
     def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:
