@@ -2,18 +2,25 @@
 
 Real functional behaviour is verified on the AutoDL pssa-vla env:
 * `Pi0Backbone.load()` requires the open-pi-zero submodule + its uv-managed
-  deps, which we install in Phase 1.6.
+  deps, which we install in Phase 1.7.
 * `LiberoDepthExtractor.extract_task()` requires libero / robosuite / mujoco
   / EGL and a GPU; we exercise it via the smoke run launched from
   `scripts/extract_libero_depth_gt.py` after this commit lands.
 
-These tests cover only the lightweight surface: import the modules, build
-the config dataclasses, parse CLI helpers, and probe submodule presence.
+The backbone tests need torch (Phase-1.6 made backbones.* nn.Module
+subclasses), so the whole module is gated on torch availability. The
+libero_geom-only tests still run via test_libero_geom_no_torch.py if/when
+we add it; for now CI without torch will skip everything in this file and
+remote pssa-vla covers full coverage.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
+
+pytest.importorskip("torch")
 
 
 def test_backbone_module_importable() -> None:

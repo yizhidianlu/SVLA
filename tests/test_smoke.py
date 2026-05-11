@@ -11,6 +11,8 @@ def test_package_imports() -> None:
 
 
 def test_subpackages_import() -> None:
+    import pytest
+    pytest.importorskip("torch")  # codebooks/experts/losses/model all import torch
     from georel_vla import codebooks, data, experts, losses, model  # noqa: F401
 
 
