@@ -105,7 +105,7 @@ class Pi0Backbone:
 
     # -- forward hooks the depth expert + model.py call -------------------
 
-    def encode_image_to_siglip(self, rgb: "torch.Tensor") -> "torch.Tensor":
+    def encode_image_to_siglip(self, rgb: torch.Tensor) -> torch.Tensor:
         """(B, 3, H, W) RGB -> (B, n_tokens, siglip_dim) pre-fusion visual tokens.
 
         This is the slice that gets fed into the depth expert per
@@ -116,10 +116,10 @@ class Pi0Backbone:
 
     def forward_action(
         self,
-        rgb: "torch.Tensor",
-        language_tokens: "torch.Tensor",
-        proprio: "torch.Tensor",
-    ) -> "tuple[torch.Tensor, dict[str, Any]]":
+        rgb: torch.Tensor,
+        language_tokens: torch.Tensor,
+        proprio: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Standard PiZero forward returning (action_chunk, aux_dict).
 
         Phase 1.6 wires through PiZero.forward / .generate_actions.

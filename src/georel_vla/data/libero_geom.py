@@ -32,9 +32,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import numpy as np
@@ -79,9 +80,9 @@ class LiberoExtractorConfig:
 
 @dataclass
 class LiberoFrame:
-    rgb: "np.ndarray"          # (H, W, 3) uint8
-    depth: "np.ndarray"        # (H, W) float32 — metric meters by default; raw z-buffer if metric_depth=False
-    action: "np.ndarray"       # (action_dim,) float32
+    rgb: np.ndarray          # (H, W, 3) uint8
+    depth: np.ndarray        # (H, W) float32 — metric meters by default; raw z-buffer if metric_depth=False
+    action: np.ndarray       # (action_dim,) float32
     step: int
 
 

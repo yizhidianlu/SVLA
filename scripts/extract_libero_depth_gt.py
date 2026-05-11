@@ -71,9 +71,6 @@ def main() -> int:
     )
     # Import the heavy stuff only after argparse so `--help` works without MuJoCo.
     from georel_vla.data.libero_geom import (
-        DEFAULT_DEMOS_ROOT,
-        DEFAULT_LIBERO_ROOT,
-        DEFAULT_OUT_ROOT,
         LiberoDepthExtractor,
         LiberoExtractorConfig,
     )

@@ -44,8 +44,9 @@ def test_backbone_describe_works_without_load() -> None:
 def test_backbone_load_raises_until_phase1_6() -> None:
     """Phase 1.6 will replace this contract; until then the wrapper signals
     'not yet wired' via NotImplementedError."""
-    from georel_vla.backbones.pi0 import Pi0Backbone
     import pytest as _pytest
+
+    from georel_vla.backbones.pi0 import Pi0Backbone
     with _pytest.raises(NotImplementedError):
         Pi0Backbone().load()
 
@@ -58,6 +59,7 @@ def test_submodule_pinned_on_disk() -> None:
     this test is informational only there).
     """
     import pytest as _pytest
+
     from georel_vla.backbones.pi0 import THIRD_PARTY_OPEN_PI_ZERO
     if not THIRD_PARTY_OPEN_PI_ZERO.exists():
         _pytest.skip("open-pi-zero submodule not initialised in this checkout")
