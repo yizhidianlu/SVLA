@@ -237,39 +237,30 @@ def main() -> int:
 
             out = model(rgb, depth_target_indices=indices)
 
-            # action-side: only when --backbone pi0 (StubBackbone has no action expert)
-            action_pred = None
-            action_target = None
+            # depth-side compute_losses always; for pi0 backbone we then add the
+            # CFM action loss DIRECTLY (forward_action_loss already returns a scalar
+            # loss; passing it through compute_losses' MSE would square it).
+            losses = model.compute_losses(
+                depth_logits=out["depth_logits"],
+                depth_target_indices=indices,
+                step=step, gamma=args.lambda_gamma,
+            )
             if args.backbone == "pi0":
                 B = rgb.size(0)
-                # rgb_uint8 for VLAProcessor (it asserts uint8 + rescales internally)
+                # rgb_uint8 for VLAProcessor (asserts uint8 + rescales internally)
                 rgb_u8 = torch.from_numpy(rgb_np).permute(0, 3, 1, 2).contiguous().to(args.device)
                 proprios = torch.from_numpy(proprio_np).unsqueeze(1).to(args.device)  # (B, T=1, P)
                 actions = torch.from_numpy(action_np).unsqueeze(1).to(args.device)    # (B, H=1, A)
-                # If LIBERO chunk size mismatches PiZero horizon_steps, broadcast across horizon.
                 horizon = backbone.pizero.horizon_steps if hasattr(backbone, "pizero") else 4
                 if actions.size(1) != horizon:
                     actions = actions.expand(B, horizon, actions.size(-1)).contiguous()
-                # Sample flow-matching t — uniform here; train.py from upstream uses Beta in beta mode.
-                t = torch.rand(B, device=args.device)
+                # Beta-mode flow time per Pi0 paper; uniform is acceptable approximation.
+                t_fm = torch.rand(B, device=args.device)
                 action_loss = backbone.forward_action_loss(
-                    rgb_u8, lang_list, proprios, actions, t,
+                    rgb_u8, lang_list, proprios, actions, t_fm,
                 )
-                # Surface as both `action_pred` placeholder and a separate explicit term
-                action_target = torch.zeros_like(action_loss)  # so compute_losses MSE adds 0
-                action_pred = action_loss
-                losses = model.compute_losses(
-                    depth_logits=out["depth_logits"],
-                    depth_target_indices=indices,
-                    action_pred=action_pred, action_target=action_target,
-                    step=step, gamma=args.lambda_gamma,
-                )
-            else:
-                losses = model.compute_losses(
-                    depth_logits=out["depth_logits"],
-                    depth_target_indices=indices,
-                    step=step, gamma=args.lambda_gamma,
-                )
+                losses["action"] = action_loss
+                losses["total"] = losses["total"] + action_loss
             opt.zero_grad()
             losses["total"].backward()
             opt.step()

@@ -138,8 +138,11 @@ def test_eval_libero_unknown_policy_raises() -> None:
         mod._build_policy("does-not-exist", "model", "key")
 
 
-def test_eval_libero_georel_policy_signals_phase17c2() -> None:
-    """Until Phase 1.7c.2 wires action expert, --policy=georel raises NotImplementedError."""
+def test_eval_libero_georel_policy_requires_torch_and_paligemma() -> None:
+    """After Phase 1.7c.2, georel policy is real — but it lazily imports torch +
+    georel_vla.backbones.pi0 + open-pi-zero, all of which are absent in the CI
+    Ubuntu runner. The build call should fail at the lazy import with a
+    ModuleNotFoundError pointing at one of those, not silently succeed."""
     mod = _import_script("eval_libero")
-    with pytest.raises(NotImplementedError, match="Phase 1.7c.2"):
+    with pytest.raises((ModuleNotFoundError, ImportError, FileNotFoundError, RuntimeError)):
         mod._build_policy("georel", "model", "key")

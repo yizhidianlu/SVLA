@@ -178,16 +178,25 @@ class Pi0Backbone(VLABackbone):
     # -- forward hooks ----------------------------------------------------
 
     def encode_image_to_siglip(self, rgb: torch.Tensor) -> torch.Tensor:
-        """(B, 3, H, W) RGB -> (B, 256, 1152) pre-fusion SigLIP features."""
+        """(B, 3, H, W) RGB -> (B, 256, 1152) pre-fusion SigLIP features.
+
+        Input may be either uint8 or float (in [0, 1]); both get normalised to
+        PaliGemma's expected range [-1, 1] (open-pi-zero `IMAGENET_STANDARD_MEAN
+        = STD = 0.5`, applied after rescale to [0, 1]).
+        """
         if self._pizero is None:
             raise RuntimeError("Pi0Backbone.load() must be called before forward")
         if rgb.ndim != 4 or rgb.size(1) != 3:
             raise ValueError(f"expected (B, 3, H, W); got {tuple(rgb.shape)}")
-        # Match the dtype the backbone is in (bf16 by default).
         target_param = next(self._pizero.vision_tower.parameters())
-        x = rgb.to(device=target_param.device, dtype=target_param.dtype)
+        x = rgb.to(device=target_param.device, dtype=torch.float32)
+        if rgb.dtype == torch.uint8:
+            x = x / 127.5 - 1.0
+        else:
+            # assume float in [0, 1]; map to [-1, 1]
+            x = 2.0 * x - 1.0
+        x = x.to(dtype=target_param.dtype)
         out = self._pizero.vision_tower(x)
-        # SiglipVisionModel.forward returns (B, num_image_tokens, hidden_size).
         if out.ndim != 3 or out.size(1) != self.n_image_tokens or out.size(2) != self.siglip_dim:
             raise RuntimeError(
                 f"SigLIP output shape {tuple(out.shape)} does not match "
