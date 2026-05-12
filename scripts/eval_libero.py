@@ -70,8 +70,35 @@ def _make_env(suite: str, task_id: int, resolution: int = 224, with_depth: bool 
 # ----- policy adapters ---------------------------------------------------
 
 
+#: LIBERO obs keys that compose the 9-d proprio vector our georel model is trained on.
+#: Order MUST match `LiberoExtractorConfig.proprio_keys` in src/georel_vla/data/libero_geom.py.
+_PROPRIO_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos")
+
+
+def _proprio_from_obs(obs: dict) -> np.ndarray:
+    """Concatenate the 9-d proprio vector from a LIBERO obs dict.
+
+    Mirrors `LiberoDepthExtractor._replay_one_demo_in_env` so train-time and
+    eval-time proprio distributions match exactly. Falls back to zeros for
+    any missing key (defensive; should never fire on a well-formed LIBERO obs).
+    """
+    pieces = []
+    for i, k in enumerate(_PROPRIO_KEYS):
+        v = obs.get(k)
+        if v is None:
+            pieces.append(np.zeros(_PROPRIO_DIMS_FALLBACK[i], dtype=np.float32))
+        else:
+            pieces.append(np.asarray(v, dtype=np.float32).reshape(-1))
+    return np.concatenate(pieces, axis=0)
+
+
 def _build_policy(name: str, model_id: str, unnorm_key: str, device: str = "cuda") -> Callable:
-    """Return a `policy(obs_rgb, language) -> action_np` callable."""
+    """Return a `policy(obs: dict, language: str) -> action_np` callable.
+
+    The policy receives the FULL LIBERO obs dict (not just RGB) so it can pull
+    real proprio for georel and apply the OpenVLA-specific 180° rotate inside
+    the openvla branch only — keeping `evaluate_task` policy-agnostic.
+    """
     if name == "openvla":
         from transformers import AutoModelForVision2Seq, AutoProcessor
         proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
@@ -79,9 +106,12 @@ def _build_policy(name: str, model_id: str, unnorm_key: str, device: str = "cuda
             model_id, trust_remote_code=True, torch_dtype="bfloat16",
         ).to(device)
 
-        def policy(obs_rgb: np.ndarray, language: str) -> np.ndarray:
+        def policy(obs: dict, language: str) -> np.ndarray:
             from PIL import Image
-            img = Image.fromarray(obs_rgb)
+            rgb = np.asarray(obs["agentview_image"], dtype=np.uint8)
+            # PSSA's documented OpenVLA-finetune training distribution = 180°-rotated.
+            rgb = _libero_image_fix(rgb)
+            img = Image.fromarray(rgb)
             prompt = f"In: What action should the robot take to {language.strip().lower()}?\nOut:"
             inputs = proc(prompt, img).to(device, dtype="bfloat16")
             action = model.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
@@ -102,11 +132,13 @@ def _build_policy(name: str, model_id: str, unnorm_key: str, device: str = "cuda
             state = torch.load(model_id, map_location=device, weights_only=False)
             bk.pizero.load_state_dict(state["model_state_dict"], strict=False)
 
-        def policy(obs_rgb: np.ndarray, language: str) -> np.ndarray:
-            rgb_u8 = torch.from_numpy(obs_rgb).permute(2, 0, 1).unsqueeze(0).contiguous().to(device)
-            # NOTE: caller must arrange to pass full obs (not just rgb) when using georel;
-            # for now, construct zero proprio fallback. Phase 1.7d wires real obs.
-            proprios = torch.zeros(1, 1, sum(_PROPRIO_DIMS_FALLBACK), device=device)
+        def policy(obs: dict, language: str) -> np.ndarray:
+            # GeoRel-VLA was trained on RAW LIBERO orientation — DO NOT rotate.
+            rgb = np.asarray(obs["agentview_image"], dtype=np.uint8)
+            rgb_u8 = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).contiguous().to(device)
+            # Real 9-d proprio matching the train-time distribution from libero_geom.py.
+            proprio_np = _proprio_from_obs(obs)
+            proprios = torch.from_numpy(proprio_np).view(1, 1, -1).to(device)
             actions = bk.infer_action(rgb_u8, [language], proprios)  # (1, horizon, action_dim)
             return actions[0, 0].cpu().float().numpy()
 
@@ -135,18 +167,28 @@ def evaluate_task(
     suite: str,
     task_id: int,
     policy: Callable,
+    policy_name: str,
     rollouts: int = 50,
     max_steps: int = 200,
     resolution: int = 224,
-    apply_image_fix: bool = True,
-    apply_action_fix: bool = True,
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
+    """Run a policy through `rollouts` LIBERO rollouts of one task.
+
+    Per-policy fix gating (no global flags any more):
+    * `openvla` policy receives the OpenVLA-trained 180°-rotated image inside
+      its closure and outputs gripper in [0,1] which we flip via
+      `_libero_action_fix` before env.step.
+    * `georel` policy receives RAW LIBERO images + real proprio inside its
+      closure and outputs LIBERO-native actions; NO outside fixes applied.
+    """
     log = log or logging.getLogger("eval_libero")
     env, task, init_states = _make_env(suite, task_id, resolution=resolution)
-    log.info("==> bench %s task %d  name=%s", suite, task_id, task.name)
+    log.info("==> bench %s task %d  name=%s policy=%s", suite, task_id, task.name, policy_name)
     n_init = len(init_states)
     rollouts = min(rollouts, n_init)
+
+    apply_action_fix_outside = policy_name == "openvla"  # georel handles its own conventions
 
     rollout_records: list[dict[str, Any]] = []
     n_success = 0
@@ -162,13 +204,10 @@ def evaluate_task(
             if steps > 0:
                 break
         for steps in range(1, max_steps + 1):
-            rgb = obs["agentview_image"]
-            if apply_image_fix:
-                rgb = _libero_image_fix(rgb)
             t0 = time.time()
-            action = policy(rgb, task.language)
+            action = policy(obs, task.language)  # FULL obs dict — policy extracts what it needs
             step_times.append((time.time() - t0) * 1000.0)
-            if apply_action_fix:
+            if apply_action_fix_outside:
                 action = _libero_action_fix(action)
             obs, _, done, info = env.step(action)
             if isinstance(done, bool) and done:
@@ -198,7 +237,8 @@ def evaluate_task(
 
     return {
         "suite": suite, "task_id": int(task_id), "task_name": task.name,
-        "task_language": task.language, "n_rollouts": rollouts, "n_success": n_success,
+        "task_language": task.language, "policy": policy_name,
+        "n_rollouts": rollouts, "n_success": n_success,
         "success_rate": n_success / rollouts if rollouts else 0.0,
         "rollouts": rollout_records,
     }
@@ -219,8 +259,13 @@ def main() -> int:
                    help="OpenVLA unnorm key; defaults to suite name (libero_spatial / libero_10 / ...)")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda")
-    p.add_argument("--libero-action-fix", action="store_true", default=True)
-    p.add_argument("--libero-image-fix", action="store_true", default=True)
+    # Per-policy fix gating now lives inside _build_policy / evaluate_task;
+    # these flags remain for backward-compat (openvla path may still respect them
+    # in the future) but currently have no effect — the policy decides.
+    p.add_argument("--libero-action-fix", action="store_true", default=True,
+                   help="(deprecated) gating now per-policy; openvla=ON, georel=OFF")
+    p.add_argument("--libero-image-fix", action="store_true", default=True,
+                   help="(deprecated) gating now per-policy; openvla=ON, georel=OFF")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -248,9 +293,8 @@ def main() -> int:
     summary = []
     for tid in task_ids:
         metrics = evaluate_task(
-            args.suite, tid, policy,
+            args.suite, tid, policy, policy_name=args.policy,
             rollouts=args.rollouts, max_steps=args.max_steps, resolution=args.resolution,
-            apply_image_fix=args.libero_image_fix, apply_action_fix=args.libero_action_fix,
             log=log,
         )
         out_path = args.out_dir / f"task{tid:02d}_metrics.json"
