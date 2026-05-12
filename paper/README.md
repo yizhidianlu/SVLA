@@ -24,11 +24,17 @@ pdflatex main.tex && bibtex main && pdflatex main.tex && pdflatex main.tex
 
 ## Status (2026-05-12)
 
-This is a Phase-1 draft. The Section 5.3 evaluation table currently has a single
-data point (task 0 = 0/10 SR); the remaining 9 LIBERO-Spatial tasks finish in
-~2.7 hr at the time of writing and the table will be patched with the full result
-once eval completes. The honest framing the paper takes (depth-supervision
-mechanism converges; task SR falls short of QDepth-VLA's published 86 % under
-the abbreviated single-A800 5-epoch budget without the Bridge-pretrained
-checkpoint or the LIBERO-90 multi-suite pretrain stage) survives the eval-table
-update — it is a budget gap, not a method gap.
+GeoRel-VLA Phase-1 paper draft. Target metric: LIBERO-Spatial overall SR ≥ 84%
+(matching/approaching QDepth-VLA's reported 86.0 %).
+
+The final numbers in §5.3 (Table~\ref{tab:ablation}) come from the Stage-C
+training run currently in flight — 3× A800 DDP, effective batch 1024, bridge_beta
+warmstart + 20-epoch LIBERO-90 pretrain + 50-epoch LIBERO-Spatial finetune,
+evaluated at 50 rollouts/task under float32 inference. v1 and v2 entries in
+the same ablation table come from the abbreviated-recipe predecessor runs
+(no warmstart, no LIBERO-90 pretrain) and serve to isolate the contribution
+of recipe vs. warmstart-plus-pretrain vs. depth-CE auxiliary head.
+
+Placeholders `XX.X` mark the eval-derived numbers; they are filled in
+automatically once `eval_libero.py --rollouts 50 --precision fp32` completes
+on the Stage-C checkpoint.
