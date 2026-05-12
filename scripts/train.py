@@ -178,6 +178,19 @@ def main() -> int:
     p.add_argument("--save-every-steps", type=int, default=2000)
     p.add_argument("--max-batches-per-epoch", type=int, default=0,
                    help="Cap iterations per epoch (0 = unlimited; useful for smoke runs)")
+    # Stage-B recipe fixes (added after Phase-1.7c-v1 produced clean loss but 0/30 SR).
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Accumulate gradients over this many micro-batches before optimizer.step (effective batch = batch * grad-accum-steps)")
+    p.add_argument("--clip-grad-norm", type=float, default=1.0,
+                   help="Max grad norm for clip_grad_norm_; 0 disables")
+    p.add_argument("--warmup-steps", type=int, default=200,
+                   help="Linear LR warmup steps; 0 disables")
+    p.add_argument("--lr-min", type=float, default=1e-8,
+                   help="Cosine LR floor (eta_min)")
+    p.add_argument("--flow-sampling", choices=["uniform", "beta"], default="beta",
+                   help="Flow-matching time sampler; Pi0 paper recommends beta")
+    p.add_argument("--clamp-actions", action="store_true", default=True,
+                   help="Clamp training actions to [-1, 1] to match PiZero inference clip")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -222,10 +235,45 @@ def main() -> int:
         [p for p in model.parameters() if p.requires_grad], lr=args.lr,
     )
 
+    # LR schedule: linear warmup over `warmup_steps` then cosine decay to lr_min.
+    # Total steps estimated from dataset size + grad accum (refined on first epoch).
+    import math  # noqa: PLC0415
+
     ds = _LiberoShardDataset(args.data_dir, seed=args.seed)
+
+    # Pre-flight: count batches in epoch 0 to size the cosine schedule total_steps
+    # without rerunning the iterator (peek the npz files for total frame count).
+    total_frames = 0
+    for shard_path in ds.shards:
+        try:
+            total_frames += int(np.load(shard_path, allow_pickle=True)["rgb"].shape[0])
+        except Exception:
+            total_frames += 100  # fallback estimate
+    batches_per_epoch = max(1, total_frames // args.batch)
+    optim_steps_per_epoch = max(1, batches_per_epoch // max(1, args.grad_accum_steps))
+    total_optim_steps = optim_steps_per_epoch * args.epochs
+    log.info("estimated %d frames / %d batches/epoch / %d optim steps total (grad_accum=%d)",
+             total_frames, batches_per_epoch, total_optim_steps, args.grad_accum_steps)
+
+    def get_lr_mult(optim_step: int) -> float:
+        if args.warmup_steps and optim_step < args.warmup_steps:
+            return (optim_step + 1) / args.warmup_steps
+        progress = (optim_step - args.warmup_steps) / max(1, total_optim_steps - args.warmup_steps)
+        progress = max(0.0, min(1.0, progress))
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return (args.lr_min / args.lr) + cos * (1.0 - args.lr_min / args.lr)
+
+    # Beta flow-matching time sampler per Pi0 paper (alpha=1.5, beta=1, flip+shift).
+    flow_beta_dist = torch.distributions.Beta(
+        torch.tensor(1.5, device=args.device), torch.tensor(1.0, device=args.device),
+    ) if args.flow_sampling == "beta" else None
+    flow_t_max = 1.0 - 1e-3
+
     metrics = []
-    step = 0
+    step = 0           # batch counter (incremented every micro-batch)
+    optim_step = 0     # optimizer step counter (incremented every grad-accum boundary)
     t_start = time.time()
+    opt.zero_grad()
     for epoch in range(args.epochs):
         ep_start = time.time()
         ep_batches = 0
@@ -261,25 +309,47 @@ def main() -> int:
                     rgb_u8 = rgb_u8_native
                 proprios = torch.from_numpy(proprio_np).unsqueeze(1).to(args.device)  # (B, T=1, P)
                 actions = torch.from_numpy(action_np).unsqueeze(1).to(args.device)    # (B, H=1, A)
+                # Stage-B fix: clamp training actions to PiZero's inference [-1, 1] range.
+                if args.clamp_actions:
+                    actions = torch.clamp(actions, -1.0, 1.0)
                 horizon = backbone.pizero.horizon_steps if hasattr(backbone, "pizero") else 4
                 if actions.size(1) != horizon:
                     actions = actions.expand(B, horizon, actions.size(-1)).contiguous()
-                # Beta-mode flow time per Pi0 paper; uniform is acceptable approximation.
-                t_fm = torch.rand(B, device=args.device)
+                # Pi0-paper beta time sampler (alpha=1.5, beta=1, flipped + shifted).
+                if flow_beta_dist is not None:
+                    z = flow_beta_dist.sample((B,))
+                    t_fm = flow_t_max * (1.0 - z)
+                else:
+                    t_fm = torch.rand(B, device=args.device) * flow_t_max
                 action_loss = backbone.forward_action_loss(
                     rgb_u8, lang_list, proprios, actions, t_fm,
                 )
                 losses["action"] = action_loss
                 losses["total"] = losses["total"] + action_loss
-            opt.zero_grad()
-            losses["total"].backward()
-            opt.step()
+
+            # Gradient accumulation: scale loss by 1/N and step optimizer every N micro-batches.
+            scaled_loss = losses["total"] / max(1, args.grad_accum_steps)
+            scaled_loss.backward()
             step += 1
             ep_batches += 1
+            if step % max(1, args.grad_accum_steps) == 0:
+                if args.clip_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad],
+                        args.clip_grad_norm,
+                    )
+                # Apply LR schedule before step()
+                lr_mult = get_lr_mult(optim_step)
+                for pg in opt.param_groups:
+                    pg["lr"] = args.lr * lr_mult
+                opt.step()
+                opt.zero_grad()
+                optim_step += 1
 
             if step % args.log_every_steps == 0:
                 row = {
-                    "epoch": epoch, "step": step,
+                    "epoch": epoch, "step": step, "optim_step": optim_step,
+                    "lr": opt.param_groups[0]["lr"],
                     "loss_total": float(losses["total"].item()),
                     "loss_depth": float(losses["depth"].item()),
                     "lambda_t": float(losses["lambda_depth_t"].item()),
@@ -289,8 +359,9 @@ def main() -> int:
                     row["loss_action"] = float(losses["action"].item())
                 metrics.append(row)
                 log.info(
-                    "ep=%d step=%d total=%.4f depth=%.4f action=%s lambda_t=%.4g t=%.0fs",
-                    epoch, step, row["loss_total"], row["loss_depth"],
+                    "ep=%d step=%d opt=%d lr=%.2e total=%.4f depth=%.4f action=%s lambda_t=%.4g t=%.0fs",
+                    epoch, step, optim_step, row["lr"],
+                    row["loss_total"], row["loss_depth"],
                     f"{row['loss_action']:.4f}" if "loss_action" in row else "n/a",
                     row["lambda_t"], row["elapsed_sec"],
                 )
