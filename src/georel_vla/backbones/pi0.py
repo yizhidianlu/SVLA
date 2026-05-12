@@ -72,6 +72,7 @@ class Pi0BackboneConfig:
     config_path: Path | None = None         # defaults to DEFAULT_CONFIG_PATH
     paligemma_dir: Path | None = None       # default = $TRANSFORMERS_CACHE/paligemma-3b-pt-224
     load_paligemma: bool = True             # if False, leave SigLIP / Gemma random-init
+    action_expert_ckpt: Path | None = None  # open-pi-zero published pi0 ckpt (e.g. bridge_beta) for warmstart
     device: str = "cuda"
     dtype: str = "bf16"                     # `bf16` | `fp16` | `fp32`
     image_size: int = 224
@@ -124,6 +125,9 @@ class Pi0Backbone(VLABackbone):
         if self.cfg.load_paligemma:
             self._best_effort_load_paligemma()
 
+        if self.cfg.action_expert_ckpt is not None:
+            self._load_action_expert_warmstart(Path(self.cfg.action_expert_ckpt))
+
         # Init the VLAProcessor + PaliGemma tokenizer for forward_action_loss /
         # infer_action; both the train and inference paths need them. They depend
         # on `pretrained_model_path` so do this AFTER _best_effort_load_paligemma()
@@ -133,6 +137,31 @@ class Pi0Backbone(VLABackbone):
         # Move to requested device + dtype.
         target_dtype = self._resolve_dtype(self.cfg.dtype)
         self._pizero = self._pizero.to(device=self.cfg.device, dtype=target_dtype)
+
+    def _load_action_expert_warmstart(self, ckpt_path: Path) -> None:
+        """Warmstart the wrapped PiZero from an open-pi-zero published checkpoint.
+
+        Supports the `bridge_beta_step19296_2024-12-26_22-30_42.pt` family from
+        `allenzren/open-pi-zero` on HF. Loaded with strict=False so trainer-
+        added or version-skewed keys do not block warmstart. Logs missing /
+        unexpected keys so subtle version drift is surfaced loudly.
+        """
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"action-expert warmstart ckpt not found: {ckpt_path}")
+        log.info("Pi0Backbone: loading action-expert warmstart from %s", ckpt_path)
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(ck, dict):
+            state = ck.get("model") or ck.get("state_dict") or ck.get("model_state_dict") or ck
+        else:
+            state = ck
+        result = self._pizero.load_state_dict(state, strict=False)
+        n_missing = len(getattr(result, "missing_keys", []))
+        n_unexpected = len(getattr(result, "unexpected_keys", []))
+        log.info("warmstart loaded: missing=%d unexpected=%d", n_missing, n_unexpected)
+        if n_missing:
+            log.info("first missing keys: %s", list(result.missing_keys)[:8])
+        if n_unexpected:
+            log.info("first unexpected keys: %s", list(result.unexpected_keys)[:8])
 
     def _resolve_dtype(self, name: str) -> torch.dtype:
         return {

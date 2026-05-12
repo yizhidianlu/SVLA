@@ -123,14 +123,36 @@ def _build_policy(name: str, model_id: str, unnorm_key: str, device: str = "cuda
         import torch
 
         from georel_vla.backbones.pi0 import Pi0Backbone, Pi0BackboneConfig
-        bk = Pi0Backbone(Pi0BackboneConfig(device=device, dtype="bf16", load_paligemma=True))
+        bk = Pi0Backbone(Pi0BackboneConfig(
+            device=device,
+            dtype=os.environ.get("GEOREL_PRECISION", "bf16"),  # set by --precision in main()
+            load_paligemma=True,
+        ))
         bk.load()
         # Optionally load a GeoRelVLA fine-tuned ckpt over the freshly-loaded
-        # PaliGemma weights. For Phase 1 this is the train.py output; if no
-        # path passed, eval runs on the PaliGemma-init backbone (sanity baseline).
+        # PaliGemma weights. GeoRelVLA saves `model.state_dict()` where every key
+        # is prefixed `backbone._pizero.` — strip that prefix before loading into
+        # `bk.pizero`. We also strip `backbone.depth_expert.` and `depth_codebook`
+        # entries since the eval-time policy only needs the action-side.
         if model_id and Path(model_id).is_file():
             state = torch.load(model_id, map_location=device, weights_only=False)
-            bk.pizero.load_state_dict(state["model_state_dict"], strict=False)
+            sd = state.get("model_state_dict", state)
+            pizero_state = {}
+            for k, v in sd.items():
+                if k.startswith("backbone._pizero."):
+                    pizero_state[k[len("backbone._pizero."):]] = v
+                elif k.startswith("backbone.pizero."):  # legacy
+                    pizero_state[k[len("backbone.pizero."):]] = v
+            if not pizero_state:
+                # fallback: maybe the ckpt is a bare PiZero state_dict (e.g., bridge_beta)
+                pizero_state = sd
+            res = bk.pizero.load_state_dict(pizero_state, strict=False)
+            n_miss = len(getattr(res, "missing_keys", []))
+            n_unx = len(getattr(res, "unexpected_keys", []))
+            logging.getLogger("eval_libero").info(
+                "georel ckpt loaded: applied=%d missing=%d unexpected=%d",
+                len(pizero_state) - n_unx, n_miss, n_unx,
+            )
 
         def policy(obs: dict, language: str) -> np.ndarray:
             # GeoRel-VLA was trained on RAW LIBERO orientation — DO NOT rotate.
@@ -259,6 +281,10 @@ def main() -> int:
                    help="OpenVLA unnorm key; defaults to suite name (libero_spatial / libero_10 / ...)")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16",
+                   help="Inference precision for georel policy. fp32 avoids open-pi-zero's "
+                        "documented 5e-4 KV-cache distribution shift on bf16; required for "
+                        "paper-grade reporting per QDepth-VLA / open-pi-zero recipe.")
     # Per-policy fix gating now lives inside _build_policy / evaluate_task;
     # these flags remain for backward-compat (openvla path may still respect them
     # in the future) but currently have no effect — the policy decides.
@@ -267,6 +293,9 @@ def main() -> int:
     p.add_argument("--libero-image-fix", action="store_true", default=True,
                    help="(deprecated) gating now per-policy; openvla=ON, georel=OFF")
     args = p.parse_args()
+
+    # Bridge --precision into _build_policy via env (avoids signature churn).
+    os.environ["GEOREL_PRECISION"] = args.precision
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")

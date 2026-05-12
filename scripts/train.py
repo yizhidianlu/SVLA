@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -37,6 +38,25 @@ import numpy as np
 def _lazy_torch():
     import torch  # noqa: PLC0415
     return torch
+
+
+def _ddp_env() -> tuple[int, int, int]:
+    """Read torchrun env (RANK / LOCAL_RANK / WORLD_SIZE). Returns (rank, local_rank, world_size)."""
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, local_rank, world_size
+
+
+def _ddp_init(local_rank: int, world_size: int):
+    """Initialise torch.distributed if world_size > 1. Returns torch device."""
+    torch = _lazy_torch()
+    if world_size > 1:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        return torch.device(f"cuda:{local_rank}")
+    return None
 
 
 # ----- dataset -----------------------------------------------------------
@@ -61,16 +81,25 @@ class _LiberoShardDataset:
         shuffle_shards: bool = True,
         seed: int = 0,
         proprio_dim_fallback: int = 9,   # 3 (eef pos) + 4 (eef quat) + 2 (parallel-jaw gripper qpos)
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.depth_clip_m = depth_clip_m
         self.shuffle_shards = shuffle_shards
-        self.rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(seed + rank)  # per-rank stream order
         self.proprio_dim_fallback = proprio_dim_fallback
+        self.rank = rank
+        self.world_size = world_size
 
-        self.shards = sorted(self.data_dir.glob("*.npz"))
-        if not self.shards:
+        all_shards = sorted(self.data_dir.glob("*.npz"))
+        if not all_shards:
             raise FileNotFoundError(f"no .npz shards under {self.data_dir}")
+        # Per-rank shard subset for DDP: deterministic round-robin assignment.
+        self.shards = all_shards[rank::world_size] if world_size > 1 else all_shards
+        if world_size > 1 and not self.shards:
+            raise RuntimeError(f"rank {rank}/{world_size} ended up with 0 shards "
+                               f"(total shards={len(all_shards)}); reduce world_size")
 
     def stream(self):
         """Yield per-frame (rgb, depth, action, proprio, language) tuples."""
@@ -134,13 +163,16 @@ def _to_rgb_tensor(rgb_np: np.ndarray, target_size: int = 224, device: str = "cu
     return x
 
 
-def _build_backbone(name: str, device: str):
+def _build_backbone(name: str, device: str, action_expert_ckpt: Path | None = None):
     if name == "stub":
         from georel_vla.backbones.stub import StubBackbone, StubBackboneConfig
         return StubBackbone(StubBackboneConfig()).to(device)
     if name == "pi0":
         from georel_vla.backbones.pi0 import Pi0Backbone, Pi0BackboneConfig
-        bk = Pi0Backbone(Pi0BackboneConfig(device=device))
+        bk = Pi0Backbone(Pi0BackboneConfig(
+            device=device,
+            action_expert_ckpt=action_expert_ckpt,
+        ))
         bk.load()
         return bk
     raise ValueError(f"unknown backbone {name!r}; expected one of [stub, pi0]")
@@ -191,16 +223,31 @@ def main() -> int:
                    help="Flow-matching time sampler; Pi0 paper recommends beta")
     p.add_argument("--clamp-actions", action="store_true", default=True,
                    help="Clamp training actions to [-1, 1] to match PiZero inference clip")
+    p.add_argument("--action-expert-ckpt", type=Path, default=None,
+                   help="Path to open-pi-zero published ckpt (e.g. bridge_beta_step19296.pt) for warmstart")
     args = p.parse_args()
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    # DDP setup (torchrun-style). Single-GPU runs are unaffected (world_size=1).
+    rank, local_rank, world_size = _ddp_env()
+    is_main = rank == 0
+    if world_size > 1:
+        args.device = f"cuda:{local_rank}"
+        _ddp_init(local_rank, world_size)
+
+    logging.basicConfig(
+        level=logging.INFO if is_main else logging.WARNING,
+        format=f"%(asctime)s [%(levelname)s] %(name)s [r{rank}/{world_size}]: %(message)s",
+    )
     log = logging.getLogger("train")
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+    if world_size > 1:
+        import torch as _t  # noqa: PLC0415
+        _t.distributed.barrier()
     torch = _lazy_torch()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
 
     log.info("loading frozen VQ-VAE codebook from %s", args.vqvae_ckpt)
     vq, vq_cfg = _load_vqvae(args.vqvae_ckpt, args.device)
@@ -208,7 +255,8 @@ def main() -> int:
     log.info("codebook: K=%d dim=%d (frozen)", codebook.shape[0], codebook.shape[1])
 
     log.info("building backbone=%s on %s", args.backbone, args.device)
-    backbone = _build_backbone(args.backbone, args.device)
+    backbone = _build_backbone(args.backbone, args.device,
+                               action_expert_ckpt=args.action_expert_ckpt)
 
     from georel_vla.experts.depth_expert import DepthExpert, DepthExpertConfig
     from georel_vla.model import GeoRelVLA, GeoRelVLAConfig
@@ -230,6 +278,16 @@ def main() -> int:
                      depth_codebook=codebook.to(args.device))
     log.info("GeoRelVLA constructed: %s", repr(model))
 
+    # DDP wrap.
+    train_module = model
+    if world_size > 1:
+        from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: PLC0415
+        # find_unused_parameters=True is safer for multi-head models (depth head can be off
+        # in some training modes; PaliGemma sub-blocks may not all participate per batch).
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True, broadcast_buffers=False)
+        train_module = model.module
+
     # Optimiser sees only trainable params (backbone may have frozen pieces in Phase 1.7c.2)
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr,
@@ -239,7 +297,8 @@ def main() -> int:
     # Total steps estimated from dataset size + grad accum (refined on first epoch).
     import math  # noqa: PLC0415
 
-    ds = _LiberoShardDataset(args.data_dir, seed=args.seed)
+    ds = _LiberoShardDataset(args.data_dir, seed=args.seed,
+                              rank=rank, world_size=world_size)
 
     # Pre-flight: count batches in epoch 0 to size the cosine schedule total_steps
     # without rerunning the iterator (peek the npz files for total frame count).
@@ -288,7 +347,7 @@ def main() -> int:
             # depth-side compute_losses always; for pi0 backbone we then add the
             # CFM action loss DIRECTLY (forward_action_loss already returns a scalar
             # loss; passing it through compute_losses' MSE would square it).
-            losses = model.compute_losses(
+            losses = train_module.compute_losses(
                 depth_logits=out["depth_logits"],
                 depth_target_indices=indices,
                 step=step, gamma=args.lambda_gamma,
@@ -296,9 +355,6 @@ def main() -> int:
             if args.backbone == "pi0":
                 import torch.nn.functional as Fnn  # noqa: PLC0415
                 B = rgb.size(0)
-                # rgb_uint8 for VLAProcessor (asserts uint8 + rescales internally).
-                # PaliGemma SigLIP-So400m expects 224x224 input (16x16 patches at /14);
-                # LIBERO native is 256x256 — resize via bilinear in fp32, then cast back.
                 rgb_u8_native = torch.from_numpy(rgb_np).permute(0, 3, 1, 2).contiguous().to(args.device)
                 if rgb_u8_native.shape[-1] != args.image_size:
                     rgb_u8 = Fnn.interpolate(
@@ -307,21 +363,19 @@ def main() -> int:
                     ).clamp(0, 255).to(torch.uint8)
                 else:
                     rgb_u8 = rgb_u8_native
-                proprios = torch.from_numpy(proprio_np).unsqueeze(1).to(args.device)  # (B, T=1, P)
-                actions = torch.from_numpy(action_np).unsqueeze(1).to(args.device)    # (B, H=1, A)
-                # Stage-B fix: clamp training actions to PiZero's inference [-1, 1] range.
+                proprios = torch.from_numpy(proprio_np).unsqueeze(1).to(args.device)
+                actions = torch.from_numpy(action_np).unsqueeze(1).to(args.device)
                 if args.clamp_actions:
                     actions = torch.clamp(actions, -1.0, 1.0)
-                horizon = backbone.pizero.horizon_steps if hasattr(backbone, "pizero") else 4
+                horizon = train_module.backbone.pizero.horizon_steps if hasattr(train_module.backbone, "pizero") else 4
                 if actions.size(1) != horizon:
                     actions = actions.expand(B, horizon, actions.size(-1)).contiguous()
-                # Pi0-paper beta time sampler (alpha=1.5, beta=1, flipped + shifted).
                 if flow_beta_dist is not None:
                     z = flow_beta_dist.sample((B,))
                     t_fm = flow_t_max * (1.0 - z)
                 else:
                     t_fm = torch.rand(B, device=args.device) * flow_t_max
-                action_loss = backbone.forward_action_loss(
+                action_loss = train_module.backbone.forward_action_loss(
                     rgb_u8, lang_list, proprios, actions, t_fm,
                 )
                 losses["action"] = action_loss
@@ -366,15 +420,19 @@ def main() -> int:
                     row["lambda_t"], row["elapsed_sec"],
                 )
 
-            if args.save_every_steps and step % args.save_every_steps == 0:
-                _save_ckpt(model, args.out_dir, step, metrics, cfg)
+            if args.save_every_steps and step % args.save_every_steps == 0 and is_main:
+                _save_ckpt(train_module, args.out_dir, step, metrics, cfg)
 
             if args.max_batches_per_epoch and ep_batches >= args.max_batches_per_epoch:
                 break
 
         log.info("epoch %d done %d batches %.1fs", epoch, ep_batches, time.time() - ep_start)
 
-    _save_ckpt(model, args.out_dir, step, metrics, cfg)
+    if is_main:
+        _save_ckpt(train_module, args.out_dir, step, metrics, cfg)
+    if world_size > 1:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
     log.info("DONE %d steps %.1fs", step, time.time() - t_start)
     return 0
 
