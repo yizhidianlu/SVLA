@@ -164,7 +164,6 @@ class LiberoDepthExtractor:
                 return
 
             env = self._make_env(suite, task)
-            env.reset()  # ONE-TIME full reset; per-demo we only set_init_state below.
             try:
                 # Recreate env every RECREATE_EVERY demos to bound robosuite's
                 # deepcopy slowdown (model state accumulates across resets — by
@@ -182,7 +181,6 @@ class LiberoDepthExtractor:
                         except Exception as exc:
                             log.warning("env.close() before recreate raised %s", exc)
                         env = self._make_env(suite, task)
-                        env.reset()
                         demos_since_recreate = 0
 
                     frames = list(self._replay_one_demo_in_env(
@@ -283,16 +281,15 @@ class LiberoDepthExtractor:
     ) -> Iterator[LiberoFrame]:
         """Replay one demo inside a *shared* env (do NOT close env here).
 
-        We skip `env.reset()` here — the caller has already called reset() once
-        after env construction. Each successive call to `reset()` in
-        robosuite/LIBERO triggers a full model rebuild
-        (`_load_robots -> SingleArm.__init__ -> deepcopy`) that gets
-        pathologically slow after ~25 demos. `set_init_state()` is sufficient
-        to position the simulation for the next replay.
+        We DO call `env.reset()` per-demo: robosuite stamps `done=True` at
+        episode end and `step()` then refuses (`executing action in terminated
+        episode`). The 26-demo deepcopy slowdown is bounded by the caller's
+        RECREATE_EVERY policy.
         """
         import numpy as np
         from robosuite.utils import camera_utils
 
+        env.reset()
         env.set_init_state(init_states[demo_idx])
         # NOTE: take the sim handle AFTER env.reset() / set_init_state.
         # LIBERO/Robosuite re-instantiate the underlying MjSim on reset, so a
