@@ -139,25 +139,55 @@ class Pi0Backbone(VLABackbone):
         self._pizero = self._pizero.to(device=self.cfg.device, dtype=target_dtype)
 
     def _load_action_expert_warmstart(self, ckpt_path: Path) -> None:
-        """Warmstart the wrapped PiZero from an open-pi-zero published checkpoint.
+        """Warmstart the wrapped PiZero from a published or trainer-saved checkpoint.
 
-        Supports the `bridge_beta_step19296_2024-12-26_22-30_42.pt` family from
-        `allenzren/open-pi-zero` on HF. Loaded with strict=False so trainer-
-        added or version-skewed keys do not block warmstart. Logs missing /
-        unexpected keys so subtle version drift is surfaced loudly.
+        Handles two source formats automatically:
+          * **bare PiZero state dict** — e.g. open-pi-zero's published
+            `bridge_beta_step19296_2024-12-26_22-30_42.pt` from
+            `allenzren/open-pi-zero` on HF. Loaded directly into `self._pizero`.
+          * **GeoRelVLA-saved state dict** — produced by `train.py`'s
+            `_save_ckpt`, where every parameter is prefixed `backbone._pizero.`
+            (with `backbone.depth_expert.*` and `depth_codebook` siblings that
+            do not belong to the PiZero submodule). The prefix is stripped and
+            non-PiZero keys are dropped before loading. This lets Stage-C
+            LIBERO-Spatial finetune warmstart cleanly from the LIBERO-90
+            pretrain checkpoint.
+
+        `strict=False` always; missing/unexpected counts are logged so
+        version drift surfaces loudly.
         """
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"action-expert warmstart ckpt not found: {ckpt_path}")
         log.info("Pi0Backbone: loading action-expert warmstart from %s", ckpt_path)
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if isinstance(ck, dict):
-            state = ck.get("model") or ck.get("state_dict") or ck.get("model_state_dict") or ck
+            raw = ck.get("model") or ck.get("state_dict") or ck.get("model_state_dict") or ck
         else:
-            state = ck
+            raw = ck
+
+        # Detect GeoRelVLA-saved format and strip the backbone._pizero. prefix.
+        pizero_prefix = None
+        for k in raw:
+            if k.startswith("backbone._pizero."):
+                pizero_prefix = "backbone._pizero."
+                break
+            if k.startswith("backbone.pizero."):  # legacy alias
+                pizero_prefix = "backbone.pizero."
+                break
+        if pizero_prefix is not None:
+            state = {k[len(pizero_prefix):]: v for k, v in raw.items()
+                     if k.startswith(pizero_prefix)}
+            log.info("warmstart: detected GeoRelVLA-saved ckpt; stripped prefix '%s' (%d keys)",
+                     pizero_prefix, len(state))
+        else:
+            state = raw
+            log.info("warmstart: treating as bare PiZero state dict (%d keys)", len(state))
+
         result = self._pizero.load_state_dict(state, strict=False)
         n_missing = len(getattr(result, "missing_keys", []))
         n_unexpected = len(getattr(result, "unexpected_keys", []))
-        log.info("warmstart loaded: missing=%d unexpected=%d", n_missing, n_unexpected)
+        log.info("warmstart loaded: applied=%d missing=%d unexpected=%d",
+                 len(state) - n_unexpected, n_missing, n_unexpected)
         if n_missing:
             log.info("first missing keys: %s", list(result.missing_keys)[:8])
         if n_unexpected:
