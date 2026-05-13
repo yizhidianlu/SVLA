@@ -102,15 +102,28 @@ class _LiberoShardDataset:
                                f"(total shards={len(all_shards)}); reduce world_size")
 
     def stream(self):
-        """Yield per-frame (rgb, depth, action, proprio, language) tuples."""
+        """Yield per-frame (rgb, depth, action, proprio, language) tuples.
+
+        Corrupt / partially-written shards (e.g. interrupted extraction that
+        left a truncated zip) raise inside np.load. We log+skip them instead
+        of crashing the whole training run — losing one shard's frames is
+        cheaper than a 20-min restart.
+        """
         import json as _json
+        import logging as _logging  # noqa: PLC0415
+        _log = _logging.getLogger("train")
         order = list(range(len(self.shards)))
         if self.shuffle_shards:
             self.rng.shuffle(order)
         for idx in order:
-            shard = np.load(self.shards[idx], allow_pickle=True)
-            rgb = shard["rgb"]                                  # (T, H, W, 3) uint8
-            depth = shard["depth"].astype(np.float32)            # (T, H, W) float16/32
+            shard_path = self.shards[idx]
+            try:
+                shard = np.load(shard_path, allow_pickle=True)
+                rgb = shard["rgb"]                               # (T, H, W, 3) uint8
+                depth = shard["depth"].astype(np.float32)        # (T, H, W) float16/32
+            except (EOFError, OSError, ValueError, KeyError) as exc:
+                _log.warning("skipping corrupt shard %s: %s", shard_path.name, exc)
+                continue
             np.clip(depth, 0.0, self.depth_clip_m, out=depth)
             action = shard["action"].astype(np.float32) if "action" in shard.files else np.zeros((rgb.shape[0], 7), np.float32)
             if "proprio" in shard.files:
