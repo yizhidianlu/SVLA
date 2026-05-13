@@ -282,10 +282,16 @@ def main() -> int:
     train_module = model
     if world_size > 1:
         from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: PLC0415
-        # find_unused_parameters=True is safer for multi-head models (depth head can be off
-        # in some training modes; PaliGemma sub-blocks may not all participate per batch).
+        # static_graph=True is required because the training loop runs TWO forward
+        # passes per iteration (depth head via GeoRelVLA.forward, then action loss via
+        # Pi0Backbone.forward_action_loss called directly through train_module.backbone).
+        # The default DDP autograd hook fires once per parameter; with two forwards
+        # sharing the encoder, some params see two backward signals and DDP raises
+        # "marked as ready twice". static_graph lets DDP trace the full multi-forward
+        # graph on iter 0 and reuse it. find_unused_parameters=False because static_graph
+        # already handles unused-param detection.
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=True, broadcast_buffers=False)
+                    static_graph=True, broadcast_buffers=False)
         train_module = model.module
 
     # Optimiser sees only trainable params (backbone may have frozen pieces in Phase 1.7c.2)
