@@ -163,31 +163,30 @@ class LiberoDepthExtractor:
             if not todo:
                 return
 
+            # Per-demo fresh env: LIBERO-90's more complex scenes trigger
+            # robosuite's `copy.deepcopy(controller_config)` slowdown in as few
+            # as 9 successive reset() calls (vs ~25 on LIBERO-Spatial), so the
+            # only fully reliable strategy is to discard the env after every
+            # demo. Per-demo env-construction overhead is ~3-5 s; with 3-way
+            # parallel extraction this adds ~25 % to total wallclock —
+            # acceptable in exchange for guaranteed forward progress.
             env = self._make_env(suite, task)
             try:
-                # Recreate env every RECREATE_EVERY demos to bound robosuite's
-                # deepcopy slowdown (model state accumulates across resets — by
-                # demo ~25 a single `_load_model` deepcopy hangs >5 min, so we
-                # never let the same env survive that long).
-                RECREATE_EVERY = 20
-                demos_since_recreate = 0
-                for demo_key in todo:
+                for i_demo, demo_key in enumerate(todo):
                     demo_idx = demo_keys.index(demo_key)
                     out_path = out_dir / f"task{task_id:02d}_{demo_key}.npz"
 
-                    if demos_since_recreate >= RECREATE_EVERY:
+                    if i_demo > 0:
                         try:
                             env.close()
                         except Exception as exc:
-                            log.warning("env.close() before recreate raised %s", exc)
+                            log.warning("env.close() before per-demo recreate raised %s", exc)
                         env = self._make_env(suite, task)
-                        demos_since_recreate = 0
 
                     frames = list(self._replay_one_demo_in_env(
                         env, task_id, demo_idx,
                         init_states, demo_actions=f["data"][demo_key]["actions"][:],
                     ))
-                    demos_since_recreate += 1
                     if not frames:
                         log.warning("no frames produced for %s demo %s", suite, demo_key)
                         continue
