@@ -104,6 +104,13 @@ GST-VLA~\citep{sarowar2026gstvla} encodes per-region depth and orientation into 
 
 \geore{} extends a frozen-then-finetuned open-$\pi_0$~\citep{ren2024openpi0} backbone (PaliGemma~\citep{paligemma2024} VLM + flow-matching action expert~\citep{lipman2022flowmatching}) with up to four auxiliary heads. \textbf{This paper implements only the depth head.} The Phase 2-3 normal, plane and support heads share the same architectural template and are documented in Appendix~\ref{appx:phase2-3} for completeness; the relevant code already lives in our public repository, gated behind config flags.
 
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_arch.pdf}
+  \caption{\geore{} architecture. RGB, language and proprioception enter the PaliGemma encoder; pre-fusion SigLIP image tokens fork into two parallel transformer experts. The \emph{action} branch is the open-$\pi_0$ action expert plus a flow-matching head emitting the next 4-step action chunk. The \emph{depth} branch is a same-shape transformer that produces $16\!\times\!16$ logits over a frozen $K{=}256$ VQ-VAE depth codebook; cross-entropy against simulator-GT depth tokens (lower row) yields the auxiliary $\Ldepth$ term. The codebook is pretrained then frozen; the supervision path is active only at training time.}
+  \label{fig:arch}
+\end{figure}
+
 \paragraph{Depth expert.} A transformer with the same shape as the open-$\pi_0$ action expert (18 layers, 8 heads, hidden 1024, intermediate 4096), fed the SigLIP-So400m visual tokens \emph{before} language fusion to avoid semantic interference with the pretrained VLM~\citep{li2025qdepthvla,paligemma2024}. The expert outputs a $16\!\times\!16$ spatial grid of $160$-d vectors, which are scored against a frozen $K{=}256$ codebook by negative L2 distance and softmax-normalised — the cross-entropy against pre-computed VQ-VAE indices on simulator-GT depth gives $\Ldepth$.
 
 \paragraph{Frozen depth VQ-VAE.} We pretrain a $K{=}256$, $d{=}160$ depth VQ-VAE on LIBERO-extracted depth maps before \geore{} training and freeze the codebook thereafter. The encoder/decoder are stride-2 conv stacks down/upsampling $256\!\to\!16$. We diverge from QDepth-VLA's reported config in one respect: we use \emph{EMA} codebook updates~\citep{vandenoord2017vqvae} with k-means initialisation from the first batch and periodic dead-code reset~\citep{razavi2019vqvae2}, because the vanilla L2-codebook variant collapsed to 6/256 active codes on LIBERO scenes (Sec.~\ref{sec:exp:vqvae}).
