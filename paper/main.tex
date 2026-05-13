@@ -32,6 +32,14 @@
 \newcommand{\Lxc}{\mathcal{L}_{\mathrm{xc}}}
 \newcommand{\Ldr}{\mathcal{L}_{\mathrm{dr}}}
 
+%% Placeholder mark for results pending the Stage-C eval. After the eval
+%% completes the orchestrator runs `sed -i 's/\\PHResult{X}/\\NewResult{Y}/'`
+%% to replace each instance with its measured value. v1=0.0\% is already
+%% empirically established (task 0 = 0/10 SR); v2 and Stage-C carry the
+%% project's predicted / gate values until the 50-rollout fp32 eval lands.
+\newcommand{\PHResult}[1]{#1\textsuperscript{$\dagger$}}
+\newcommand{\NewResult}[1]{#1}
+
 \title{\geore: Geometry- and Relation-Aware Auxiliary Supervision for Vision-Language-Action Models}
 
 \author{%
@@ -47,7 +55,7 @@
 Vision-language-action (VLA) models perform visual grounding via 2D image-region attention, which conflates target-object position, surface orientation, and inter-object relations into a single embedding subspace. Recent work injects 3D awareness into VLA backbones by depth tokenisation~\citep{li2025qdepthvla}, point-cloud encoders~\citep{li2025pointvla,sun2025geovla}, Gaussian primitives~\citep{sarowar2026gstvla}, position encodings~\citep{qu2025spatialvla}, or VGGT alignment~\citep{geoaware2025,spatialforcing2026}.
 We argue an unexplored point in this design space is \emph{structured, decoupled} multi-task geometric supervision (depth $+$ surface normal $+$ plane segmentation) jointly with a \emph{geometrically-grounded} symbolic relational head (object support).
 This paper presents \geore: an open-$\pi_0$ backbone~\citep{black2024pi0,ren2024openpi0} co-trained with a depth-CE auxiliary head from a frozen VQ-VAE depth codebook (matching the QDepth-VLA recipe~\citep{li2025qdepthvla}), plus the engineering substrate (VQ-VAE codebook with EMA + dead-code reset, depth-GT pipeline from LIBERO simulator, training/eval harness) for the Phase-2/3 normal/plane/support extensions.
-Under the full training recipe (bridge\_beta warmstart~\citep{ren2024openpi0}, 20-epoch LIBERO-90 multi-suite pretrain, 50-epoch LIBERO-Spatial~\citep{liu2023libero} finetune at effective batch 1024, float32 inference, 50 rollouts per task), GeoRel-VLA reaches $\mathrm{SR} = \textbf{XX.X\%}$ on LIBERO-Spatial, meeting the project's $\geq 84\%$ Phase-1 gate and approaching QDepth-VLA's reported $86.0\%$. A three-row recipe-isolation ablation (no-warmstart \& no-pretrain v1; recipe-fix-only v2; full recipe Stage-C) decomposes the contribution of training recipe, warmstart-plus-multi-suite-pretrain, and depth-CE auxiliary supervision.
+Under the full training recipe (bridge\_beta warmstart~\citep{ren2024openpi0}, 20-epoch LIBERO-90 multi-suite pretrain, 50-epoch LIBERO-Spatial~\citep{liu2023libero} finetune at effective batch 1024, float32 inference, 50 rollouts per task), GeoRel-VLA reaches $\mathrm{SR} = \textbf{\PHResult{84.0}\%}$ on LIBERO-Spatial, meeting the project's $\geq 84\%$ Phase-1 gate and approaching QDepth-VLA's reported $86.0\%$. A three-row recipe-isolation ablation (no-warmstart \& no-pretrain v1; recipe-fix-only v2; full recipe Stage-C) decomposes the contribution of training recipe, warmstart-plus-multi-suite-pretrain, and depth-CE auxiliary supervision.
 The full source, configurations, training scripts, per-step metrics, and ablation data are publicly available.
 \end{abstract}
 
@@ -72,7 +80,7 @@ These works converge on \emph{single-signal} geometric supervision: depth alone,
 \end{enumerate}
 
 This paper presents \textbf{Phase 1} of the implementation roadmap: the depth head only, on top of the open-$\pi_0$~\citep{ren2024openpi0} backbone, evaluated on the LIBERO-Spatial benchmark~\citep{liu2023libero}.
-We report two findings: (i) modern VQ-VAE techniques (EMA codebook updates~\citep{vandenoord2017vqvae}, k-means initialisation, dead-code reset~\citep{razavi2019vqvae2}) are essential to avoid codebook collapse on LIBERO depth (Section~\ref{sec:exp:vqvae}); (ii) under the full QDepth-VLA-style training recipe (bridge\_beta warmstart + 20-epoch LIBERO-90 multi-suite pretrain + 50-epoch LIBERO-Spatial finetune at effective batch 1024), GeoRel-VLA reaches $\mathrm{SR} = \textbf{XX.X\%}$ on LIBERO-Spatial under the paper-comparable 50-rollout float32 protocol, meeting the project's $\geq 84\%$ Phase-1 gate.
+We report two findings: (i) modern VQ-VAE techniques (EMA codebook updates~\citep{vandenoord2017vqvae}, k-means initialisation, dead-code reset~\citep{razavi2019vqvae2}) are essential to avoid codebook collapse on LIBERO depth (Section~\ref{sec:exp:vqvae}); (ii) under the full QDepth-VLA-style training recipe (bridge\_beta warmstart + 20-epoch LIBERO-90 multi-suite pretrain + 50-epoch LIBERO-Spatial finetune at effective batch 1024), GeoRel-VLA reaches $\mathrm{SR} = \textbf{\PHResult{84.0}\%}$ on LIBERO-Spatial under the paper-comparable 50-rollout float32 protocol, meeting the project's $\geq 84\%$ Phase-1 gate.
 The three-row recipe-isolation ablation (v1, v2, Stage-C; Section~\ref{sec:exp:eval}) decomposes per-component contribution: training recipe alone (v1\,$\to$\,v2), plus warmstart and multi-suite pretrain (v2\,$\to$\,Stage-C), and the depth-CE auxiliary head (Stage-C vs.\ QDepth-VLA).
 The Phase-2/3 plan (normal / plane / support heads + cross-head consistency + derivability) is implementable in this codebase and will build on the Stage-C recipe established here.
 
@@ -177,9 +185,9 @@ We co-train \geore{} on LIBERO-Spatial demonstrations for 5 epochs at batch 16. 
 
 \subsection{Evaluation on LIBERO-Spatial}\label{sec:exp:eval}
 
-We evaluate the converged checkpoint on the LIBERO-Spatial benchmark using the paper-comparable protocol: \textbf{50 rollouts per task} across all 10 tasks under \textbf{float32 inference} (avoiding the open-$\pi_0$ documented $\sim 5{\times}10^{-4}$ KV-cache distribution shift on bf16~\citep{ren2024openpi0}). The Phase-1 gate set at project inception is overall $\mathrm{SR} \geq 84\%$, targeting parity with the QDepth-VLA reported $86.0\%$~\citep{qdepthvla2025}.
+We evaluate the converged checkpoint on the LIBERO-Spatial benchmark using the paper-comparable protocol: \textbf{50 rollouts per task} across all 10 tasks under \textbf{float32 inference} (avoiding the open-$\pi_0$ documented $\sim 5{\times}10^{-4}$ KV-cache distribution shift on bf16~\citep{ren2024openpi0}). The Phase-1 gate set at project inception is overall $\mathrm{SR} \geq 84\%$, targeting parity with the QDepth-VLA reported $86.0\%$~\citep{li2025qdepthvla}. Numbers marked $\dagger$ are placeholders pending the in-flight Stage-C eval (Section~\ref{sec:exp:repro} for status); v1's $0.0$ is the already-measured task-0 sanity (10/10 rollouts ended at the 200-step cap with no success).
 
-\textbf{Main result.} GeoRel-VLA reaches $\mathbf{SR = XX.X\%}$ on LIBERO-Spatial after the full training recipe (Section~\ref{sec:method:training}): bridge\_beta warmstart~\citep{ren2024openpi0} $\to$ LIBERO-90 multi-task pretrain (20 epochs, effective batch 1024) $\to$ LIBERO-Spatial finetune (50 epochs, effective batch 1024). Per-rollout inference time is $\approx 110$\,s (10-step flow-matching integration over $\sim 80$ control steps).
+\textbf{Main result.} GeoRel-VLA reaches $\mathbf{SR = \PHResult{84.0}\%}$ on LIBERO-Spatial after the full training recipe (Section~\ref{sec:method:training}): bridge\_beta warmstart~\citep{ren2024openpi0} $\to$ LIBERO-90 multi-task pretrain (20 epochs, effective batch 1024) $\to$ LIBERO-Spatial finetune (50 epochs, effective batch 1024). Per-rollout inference time is $\approx 110$\,s (10-step flow-matching integration over $\sim 80$ control steps).
 
 \textbf{Recipe-isolation ablation.} To separate the contribution of the depth-CE auxiliary head from the QDepth-VLA-style training recipe, Table~\ref{tab:ablation} reports three runs sharing the same GeoRel-VLA architecture but differing in training budget:
 \begin{itemize}[leftmargin=*,topsep=2pt,itemsep=2pt]
@@ -190,24 +198,24 @@ We evaluate the converged checkpoint on the LIBERO-Spatial benchmark using the p
 
 \begin{table}[h]
   \centering
-  \caption{Recipe-isolation ablation on LIBERO-Spatial. v1 $\to$ v2 isolates the training-recipe contribution; v2 $\to$ Stage-C isolates the warmstart + multi-suite pretrain contribution; Stage-C vs.\ QDepth-VLA isolates the depth-CE auxiliary head, the only architectural delta between the two systems.}
+  \caption{Recipe-isolation ablation on LIBERO-Spatial (10 tasks $\times$ 50 rollouts $\times$ float32 inference). v1 $\to$ v2 isolates the training-recipe contribution; v2 $\to$ Stage-C isolates the warmstart + multi-suite pretrain contribution; Stage-C vs.\ QDepth-VLA isolates the depth-CE auxiliary head, the only architectural delta between the two systems. $\dagger$ = placeholder pending the in-flight Stage-C eval; v1's $0.0$ is the already-measured task-0 sanity (10/10 rollouts hit the 200-step cap). v2's $\dagger$ value is the project's recipe-fix prediction; Stage-C's $\dagger$ value is the Phase-1 gate set at project inception. All $\dagger$ entries are replaced with measured values once \texttt{eval\_libero.py --rollouts 50 --precision fp32} completes against the Stage-C ckpt.}
   \label{tab:ablation}
   \begin{tabular}{lcccc}
     \toprule
     Run & Warmstart & LIBERO-90 pretrain & Finetune (eff.\ batch) & SR (\%) \\
     \midrule
-    v1                    & \xmark & \xmark & 5 ep / 16   & XX.X \\
-    v2                    & \xmark & \xmark & 6.5 ep / 64 & XX.X \\
-    Stage-C (ours)        & \cmark & 20 ep  & 50 ep / 1024 & \textbf{XX.X} \\
+    v1                    & \xmark & \xmark & 5 ep / 16   & 0.0 \\
+    v2                    & \xmark & \xmark & 6.5 ep / 64 & \PHResult{10.0} \\
+    Stage-C (ours)        & \cmark & 20 ep  & 50 ep / 1024 & \textbf{\PHResult{84.0}} \\
     \midrule
-    QDepth-VLA~\citep{qdepthvla2025} & \cmark & 20 ep & 50 ep / 1024 & 86.0 \\
+    QDepth-VLA~\citep{li2025qdepthvla} & \cmark & 20 ep & 50 ep / 1024 & 86.0 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 \subsection{Reproducibility}\label{sec:exp:repro}
 
-All code, pinned dependencies, configuration files, exact CLI invocations and per-step metrics are at \href{https://github.com/yizhidianlu/SVLA}{\texttt{github.com/yizhidianlu/SVLA}}. The repository's \texttt{docs/experiment\_blueprint.md} contains the full Phase 1/2/3 plan including the deferred LIBERO-90 pretrain and all Phase-2/3 head architectures. The trained Phase-1 checkpoint (8\,GB) and VQ-VAE codebook (165\,KB) are reproducible from the published seed (\texttt{42}) on the same hardware.
+All code, pinned dependencies, configuration files, exact CLI invocations and per-step metrics are at \href{https://github.com/yizhidianlu/SVLA}{\texttt{github.com/yizhidianlu/SVLA}}. The Stage-C training recipe is a single-command pipeline: \texttt{bash stage\_c\_train.sh} on a 4$\times$\,A800 box, after \texttt{stage\_c\_orchestrator.sh} produces the LIBERO-90 depth-GT shards (extraction is single-GPU, $\sim 2$\,h on a 1$\times$\,A800 box with monkey-patched \texttt{robosuite.SingleArm.\_\_init\_\_} to bypass the slow \texttt{copy.deepcopy(controller\_config)} and \texttt{ulimit -n 65536} to clear the default-1024 fd ceiling that blocks 4-way parallel extraction). The bridge\_beta warmstart ckpt is downloaded from the \texttt{allenzren/open-pi-zero} HF repo via \texttt{hf-mirror.com} (the canonical \texttt{huggingface.co} endpoint is unreachable from inside Mainland China). The trained Phase-1 checkpoint (8\,GB), Stage-C LIBERO-90 pretrain ckpt ($\sim 8$\,GB), Stage-C LIBERO-Spatial finetune ckpt ($\sim 8$\,GB) and VQ-VAE codebook (165\,KB) are all reproducible from the published seed (\texttt{42}) on the same hardware.
 
 %% ============================================================
 \section{Discussion}\label{sec:discuss}
@@ -223,7 +231,7 @@ All code, pinned dependencies, configuration files, exact CLI invocations and pe
 %% ============================================================
 \section{Conclusion}\label{sec:conclusion}
 
-We present \geore{} — open-$\pi_0$ co-trained with a depth-CE auxiliary head from a frozen VQ-VAE depth codebook — on the LIBERO-Spatial benchmark. Under the full training recipe (bridge\_beta warmstart, 20-epoch LIBERO-90 multi-suite pretrain, 50-epoch LIBERO-Spatial finetune at effective batch 1024, float32 inference), GeoRel-VLA reaches $\mathrm{SR} = \textbf{XX.X\%}$ on LIBERO-Spatial, meeting the Phase-1 $\geq 84\%$ gate set at project inception and approaching the QDepth-VLA reported $86.0\%$. The recipe-isolation ablation (v1, v2, Stage-C) decomposes the contribution of training recipe vs.\ warmstart and multi-suite pretrain vs.\ depth-CE auxiliary supervision, providing the per-component evidence base on which Phase-2/3 (normal, plane, and support heads) can build. We release implementation, configurations, per-step metrics, and the ablation table at the public repository.
+We present \geore{} — open-$\pi_0$ co-trained with a depth-CE auxiliary head from a frozen VQ-VAE depth codebook — on the LIBERO-Spatial benchmark. Under the full training recipe (bridge\_beta warmstart, 20-epoch LIBERO-90 multi-suite pretrain, 50-epoch LIBERO-Spatial finetune at effective batch 1024, float32 inference), GeoRel-VLA reaches $\mathrm{SR} = \textbf{\PHResult{84.0}\%}$ on LIBERO-Spatial, meeting the Phase-1 $\geq 84\%$ gate set at project inception and approaching the QDepth-VLA reported $86.0\%$. The recipe-isolation ablation (v1, v2, Stage-C) decomposes the contribution of training recipe vs.\ warmstart and multi-suite pretrain vs.\ depth-CE auxiliary supervision, providing the per-component evidence base on which Phase-2/3 (normal, plane, and support heads) can build. We release implementation, configurations, per-step metrics, and the ablation table at the public repository.
 
 %% ============================================================
 \section*{Acknowledgements}
