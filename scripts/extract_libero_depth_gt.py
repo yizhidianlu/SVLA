@@ -63,12 +63,38 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _patch_robosuite_deepcopy() -> None:
+    """Robosuite's `SingleArm.__init__` deepcopy(controller_config) is the
+    bottleneck of LIBERO-90 extraction — by ~demo 11 it slows from 50 ms to
+    several minutes per call, with stack samples confirming live execution
+    inside copy.deepcopy on a controller_config dict that grows by reference
+    each time. Replace the `__init__` to use shallow copy: we never reuse
+    the configs across envs, so mutations are scoped to the env's lifetime.
+    """
+    import copy as _copy
+    import robosuite.robots.single_arm as _sa
+    _orig = _sa.SingleArm.__init__
+
+    def _fast_init(self, *args, **kwargs):
+        _dc = _copy.deepcopy
+        _copy.deepcopy = _copy.copy
+        try:
+            _orig(self, *args, **kwargs)
+        finally:
+            _copy.deepcopy = _dc
+
+    _sa.SingleArm.__init__ = _fast_init
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Patch robosuite BEFORE any env construction.
+    _patch_robosuite_deepcopy()
+
     # Import the heavy stuff only after argparse so `--help` works without MuJoCo.
     from georel_vla.data.libero_geom import (
         LiberoDepthExtractor,
