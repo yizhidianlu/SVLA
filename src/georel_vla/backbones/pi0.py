@@ -183,6 +183,21 @@ class Pi0Backbone(VLABackbone):
             state = raw
             log.info("warmstart: treating as bare PiZero state dict (%d keys)", len(state))
 
+        # Drop keys whose tensor shape disagrees with our model. The most common
+        # mismatch is proprio_encoder.weight (bridge uses 7-d POS_EULER proprio;
+        # LIBERO uses 9-d eef_pos+quat+gripper), but the same logic handles any
+        # other shape drift. The dropped parameters fall back to random init.
+        own = self._pizero.state_dict()
+        dropped = []
+        for k in list(state.keys()):
+            if k in own and own[k].shape != state[k].shape:
+                dropped.append((k, tuple(own[k].shape), tuple(state[k].shape)))
+                del state[k]
+        if dropped:
+            log.warning("warmstart: dropped %d keys with shape mismatch (random-init those):", len(dropped))
+            for k, want, got in dropped[:8]:
+                log.warning("  %s: model wants %s, ckpt has %s", k, want, got)
+
         result = self._pizero.load_state_dict(state, strict=False)
         n_missing = len(getattr(result, "missing_keys", []))
         n_unexpected = len(getattr(result, "unexpected_keys", []))
