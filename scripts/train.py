@@ -291,6 +291,41 @@ def main() -> int:
                      depth_codebook=codebook.to(args.device))
     log.info("GeoRelVLA constructed: %s", repr(model))
 
+    # Phase-2 resume restoration: if --action-expert-ckpt is a GeoRelVLA-saved
+    # ckpt (has "backbone._pizero." prefix), Pi0Backbone._load_action_expert_warmstart
+    # already loaded the pizero side into self.backbone._pizero. We additionally
+    # restore the depth_expert.* and depth_codebook keys here so a resume run
+    # picks up where the previous run left off without losing the depth head
+    # (which otherwise re-initialises from scratch and wastes ~5K opt steps
+    # relearning).
+    if args.action_expert_ckpt:
+        ck = torch.load(args.action_expert_ckpt, map_location="cpu", weights_only=False)
+        raw = (ck.get("model") or ck.get("state_dict") or ck.get("model_state_dict") or ck) if isinstance(ck, dict) else ck
+        has_geor_prefix = any(
+            k.startswith("backbone._pizero.") or k.startswith("backbone.pizero.")
+            for k in raw
+        )
+        if has_geor_prefix:
+            # Keep ONLY the keys that belong to the GeoRelVLA wrapper but NOT to
+            # pizero (already loaded). That leaves depth_expert.* and depth_codebook.
+            extra = {
+                k: v for k, v in raw.items()
+                if not (k.startswith("backbone._pizero.") or k.startswith("backbone.pizero."))
+            }
+            if extra:
+                # Shape-mismatch filter (defensive — codebook shape can drift across runs).
+                own = model.state_dict()
+                kept = {}
+                for k, v in extra.items():
+                    if k in own and own[k].shape == v.shape:
+                        kept[k] = v
+                res = model.load_state_dict(kept, strict=False)
+                log.info("resume: restored %d non-pizero keys (depth_expert+codebook); "
+                         "missing=%d unexpected=%d",
+                         len(kept),
+                         len(getattr(res, "missing_keys", [])),
+                         len(getattr(res, "unexpected_keys", [])))
+
     # DDP wrap.
     train_module = model
     if world_size > 1:
