@@ -42,6 +42,31 @@ def _set_egl_env() -> None:
     os.environ.setdefault("HF_HOME", "/root/autodl-tmp/hf")
 
 
+def _patch_robosuite_deepcopy() -> None:
+    """Monkey-patch SingleArm.__init__ to use shallow copy.
+
+    Robosuite's `SingleArm.__init__` does `copy.deepcopy(controller_config)` whose
+    cost grows pathologically across repeated env constructions; after ~17 rollouts
+    on LIBERO-Spatial the deepcopy hangs for many minutes. Same fix as the
+    extractor (see scripts/extract_libero_depth_gt.py): swap deepcopy with
+    copy.copy for the duration of __init__. Safe because we don't reuse the
+    configs across envs.
+    """
+    import copy as _copy
+    import robosuite.robots.single_arm as _sa
+    _orig = _sa.SingleArm.__init__
+
+    def _fast_init(self, *args, **kwargs):
+        _dc = _copy.deepcopy
+        _copy.deepcopy = _copy.copy
+        try:
+            _orig(self, *args, **kwargs)
+        finally:
+            _copy.deepcopy = _dc
+
+    _sa.SingleArm.__init__ = _fast_init
+
+
 _PROPRIO_DIMS_FALLBACK = (3, 4, 2)  # eef pos + eef quat + parallel-jaw gripper qpos = 9 dims
 
 
@@ -301,6 +326,7 @@ def main() -> int:
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     log = logging.getLogger("eval_libero")
     _set_egl_env()
+    _patch_robosuite_deepcopy()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # parse task ids
