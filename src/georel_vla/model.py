@@ -76,6 +76,12 @@ class GeoRelVLAConfig:
     lambda_cross_consistency: float = 0.002
     lambda_derivability: float = 0.003
 
+    # Phase-2 normal head config.
+    normal_codebook_size: int = 128
+    normal_embedding_dim: int = 160
+    normal_latent_h: int = 16
+    normal_latent_w: int = 16
+
     # action chunk size for the (Phase-1.7) action-loss compute.
     action_chunk_size: int = 4
 
@@ -102,6 +108,8 @@ class GeoRelVLA(nn.Module):
         backbone: VLABackbone,
         depth_expert: DepthExpert,
         depth_codebook: torch.Tensor,
+        normal_expert: DepthExpert | None = None,
+        normal_codebook: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(backbone, VLABackbone):
@@ -130,6 +138,16 @@ class GeoRelVLA(nn.Module):
         # Codebook is frozen during VLA training (QDepth-VLA §3.2).
         # Held as a buffer so it round-trips with state_dict() / .to(device).
         self.register_buffer("depth_codebook", depth_codebook.detach().clone())
+
+        # Phase-2 optional normal head. When provided + cfg.use_normal, the
+        # forward pass also produces normal logits and compute_losses adds the
+        # auxiliary L_normal term with its own lambda + gamma schedule.
+        self.normal_expert = None
+        if normal_expert is not None and cfg.use_normal:
+            self.normal_expert = normal_expert
+            if normal_codebook is None:
+                raise ValueError("normal_codebook required when normal_expert is provided")
+            self.register_buffer("normal_codebook", normal_codebook.detach().clone())
 
     # -- factory ---------------------------------------------------------
 
@@ -178,6 +196,13 @@ class GeoRelVLA(nn.Module):
         """Run the depth expert; return logits + raw embed for downstream losses."""
         depth_logits, depth_embed = self.depth_expert(siglip_features, self.depth_codebook)
         return {"depth_logits": depth_logits, "depth_embed": depth_embed}
+
+    def forward_normal(self, siglip_features: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Run the normal expert (Phase-2); empty if disabled."""
+        if self.normal_expert is None:
+            return {}
+        n_logits, n_embed = self.normal_expert(siglip_features, self.normal_codebook)
+        return {"normal_logits": n_logits, "normal_embed": n_embed}
 
     def forward(
         self,
@@ -229,35 +254,36 @@ class GeoRelVLA(nn.Module):
         depth_target_indices: torch.Tensor,
         action_pred: torch.Tensor | None = None,
         action_target: torch.Tensor | None = None,
+        normal_logits: torch.Tensor | None = None,
+        normal_target_indices: torch.Tensor | None = None,
         step: int = 0,
         gamma: float = 0.9999,
     ) -> dict[str, torch.Tensor]:
-        """Combine the per-head losses with the QDepth-VLA exponential decay.
-
-        `lambda_depth_t = cfg.lambda_depth * gamma^step`.
-
-        Phase 1.7 will plug in `action_pred` / `action_target` from the
-        backbone CFM head; until then the action loss is omitted from the
-        sum and `total = lambda_depth * L_depth` only.
-        """
+        """Combine the per-head losses with the QDepth-VLA exponential decay."""
         losses: dict[str, torch.Tensor] = {}
         device = depth_logits.device
 
         # depth CE
         l_depth = depth_ce_loss(depth_logits, depth_target_indices)
         losses["depth"] = l_depth
-
         lambda_d = _exp_decay_lambda(self.cfg.lambda_depth, gamma, step)
         weighted_total = lambda_d * l_depth
+        losses["lambda_depth_t"] = torch.tensor(lambda_d, device=device)
+
+        # Phase-2 normal CE (only if both logits and target supplied)
+        if normal_logits is not None and normal_target_indices is not None:
+            l_normal = depth_ce_loss(normal_logits, normal_target_indices)
+            losses["normal"] = l_normal
+            lambda_n = _exp_decay_lambda(self.cfg.lambda_normal, gamma, step)
+            weighted_total = weighted_total + lambda_n * l_normal
+            losses["lambda_normal_t"] = torch.tensor(lambda_n, device=device)
 
         if action_pred is not None and action_target is not None:
-            # Plain MSE placeholder — Phase 1.7 swaps for backbone.cfm_loss().
             l_action = nn.functional.mse_loss(action_pred, action_target)
             losses["action"] = l_action
             weighted_total = weighted_total + l_action
 
         losses["total"] = weighted_total
-        losses["lambda_depth_t"] = torch.tensor(lambda_d, device=device)
         return losses
 
     # -- attention layout ------------------------------------------------

@@ -53,6 +53,10 @@ class _DepthShardDataset:
 
     We keep the implementation deliberately lightweight (no torch.utils.data
     DataLoader) so the file is independent of torch when --help is invoked.
+
+    `head_mode` controls the output channels:
+      - "depth": yield (1, H, W) depth in metres
+      - "normal": compute analytic surface-normal from depth and yield (3, H, W)
     """
 
     def __init__(
@@ -62,12 +66,14 @@ class _DepthShardDataset:
         depth_clip_m: float = 5.0,
         shuffle_shards: bool = True,
         seed: int = 0,
+        head_mode: str = "depth",
     ) -> None:
         self.data_dir = Path(data_dir)
         self.target_resolution = target_resolution
         self.depth_clip_m = depth_clip_m
         self.shuffle_shards = shuffle_shards
         self.rng = np.random.default_rng(seed)
+        self.head_mode = head_mode
 
         self.shards = sorted(self.data_dir.glob("*.npz"))
         if not self.shards:
@@ -77,20 +83,26 @@ class _DepthShardDataset:
         return len(self.shards)
 
     def stream_frames(self) -> Iterator[np.ndarray]:
-        """Yield individual (1, H, W) depth tensors as float32 in [0, depth_clip_m].
-
-        Iteration order: shards in `self.rng`-determined order; within each
-        shard the original temporal order is preserved.
-        """
+        """Yield individual (C, H, W) tensors. C=1 for depth, C=3 for normal."""
         order = list(range(len(self.shards)))
         if self.shuffle_shards:
             self.rng.shuffle(order)
         for idx in order:
-            shard = np.load(self.shards[idx], allow_pickle=True)
-            depth = shard["depth"].astype(np.float32)            # (T, H, W)
+            try:
+                shard = np.load(self.shards[idx], allow_pickle=True)
+                depth = shard["depth"].astype(np.float32)        # (T, H, W)
+            except Exception:
+                continue
             depth = np.clip(depth, 0.0, self.depth_clip_m)
             for t in range(depth.shape[0]):
-                yield depth[t : t + 1]                            # (1, H, W)
+                if self.head_mode == "depth":
+                    yield depth[t : t + 1]                       # (1, H, W)
+                elif self.head_mode == "normal":
+                    from georel_vla.data.normal_from_depth import depth_to_normal_np  # noqa: PLC0415
+                    n = depth_to_normal_np(depth[t])             # (H, W, 3)
+                    yield n.transpose(2, 0, 1)                   # (3, H, W)
+                else:
+                    raise ValueError(f"unknown head_mode {self.head_mode}")
 
     def yield_batches(self, batch_size: int, shuffle_within: bool = True) -> Iterator[np.ndarray]:
         """Group consecutive frames into batches of (B, 1, H, W)."""
@@ -145,8 +157,9 @@ def main() -> int:
     torch = _lazy_torch()
     from georel_vla.codebooks.vqvae import VQVAE, VQVAEConfig
 
+    in_ch = 3 if args.head == "normal" else 1
     cfg = VQVAEConfig(
-        in_channels=1, out_channels=1,
+        in_channels=in_ch, out_channels=in_ch,
         embedding_dim=args.embedding_dim,
         num_embeddings=args.num_embeddings,
         downsample=256 // args.latent_grid,
@@ -162,6 +175,7 @@ def main() -> int:
     ds = _DepthShardDataset(
         args.data_dir, target_resolution=256,
         depth_clip_m=args.depth_clip_m, seed=args.seed,
+        head_mode=args.head,
     )
     log.info("dataset: %d shards under %s", ds.shard_count(), args.data_dir)
 

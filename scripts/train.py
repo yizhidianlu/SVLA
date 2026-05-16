@@ -238,6 +238,10 @@ def main() -> int:
                    help="Clamp training actions to [-1, 1] to match PiZero inference clip")
     p.add_argument("--action-expert-ckpt", type=Path, default=None,
                    help="Path to open-pi-zero published ckpt (e.g. bridge_beta_step19296.pt) for warmstart")
+    p.add_argument("--normal-vqvae-ckpt", type=Path, default=None,
+                   help="Phase-2: Path to pretrained normal VQ-VAE ckpt. When set, enables normal head.")
+    p.add_argument("--lambda-normal", type=float, default=0.01,
+                   help="Phase-2: weight for normal-CE auxiliary loss (same schedule as lambda-depth)")
     args = p.parse_args()
 
     # DDP setup (torchrun-style). Single-GPU runs are unaffected (world_size=1).
@@ -274,21 +278,55 @@ def main() -> int:
     from georel_vla.experts.depth_expert import DepthExpert, DepthExpertConfig
     from georel_vla.model import GeoRelVLA, GeoRelVLAConfig
 
-    cfg = GeoRelVLAConfig(
+    # Phase-2: load optional normal VQ-VAE codebook.
+    normal_vq = None
+    normal_vq_cfg = None
+    normal_codebook = None
+    if args.normal_vqvae_ckpt is not None:
+        log.info("loading frozen normal VQ-VAE from %s", args.normal_vqvae_ckpt)
+        normal_vq, normal_vq_cfg = _load_vqvae(args.normal_vqvae_ckpt, args.device)
+        normal_codebook = normal_vq.quantizer.codebook.weight.detach().clone()
+        log.info("normal codebook: K=%d dim=%d (frozen)",
+                 normal_codebook.shape[0], normal_codebook.shape[1])
+
+    cfg_kwargs = dict(
         depth_codebook_size=vq_cfg.num_embeddings,
         depth_embedding_dim=vq_cfg.embedding_dim,
         depth_latent_h=256 // vq_cfg.downsample,
         depth_latent_w=256 // vq_cfg.downsample,
         lambda_depth=args.lambda_depth,
+        lambda_normal=args.lambda_normal,
     )
+    if normal_vq_cfg is not None:
+        cfg_kwargs["use_normal"] = True
+        cfg_kwargs["normal_codebook_size"] = normal_vq_cfg.num_embeddings
+        cfg_kwargs["normal_embedding_dim"] = normal_vq_cfg.embedding_dim
+        cfg_kwargs["normal_latent_h"] = 256 // normal_vq_cfg.downsample
+        cfg_kwargs["normal_latent_w"] = 256 // normal_vq_cfg.downsample
+    cfg = GeoRelVLAConfig(**cfg_kwargs)
+
     expert = DepthExpert(DepthExpertConfig(
         siglip_dim=backbone.siglip_dim, n_img_tokens=backbone.n_image_tokens,
         latent_h=cfg.depth_latent_h, latent_w=cfg.depth_latent_w,
         embedding_dim=cfg.depth_embedding_dim, num_embeddings=cfg.depth_codebook_size,
     )).to(args.device)
 
-    model = GeoRelVLA(cfg, backbone=backbone, depth_expert=expert,
-                     depth_codebook=codebook.to(args.device))
+    normal_expert = None
+    if cfg.use_normal:
+        normal_expert = DepthExpert(DepthExpertConfig(
+            siglip_dim=backbone.siglip_dim, n_img_tokens=backbone.n_image_tokens,
+            latent_h=cfg.normal_latent_h, latent_w=cfg.normal_latent_w,
+            embedding_dim=cfg.normal_embedding_dim, num_embeddings=cfg.normal_codebook_size,
+        )).to(args.device)
+        log.info("Phase-2 normal head enabled (K=%d dim=%d)",
+                 cfg.normal_codebook_size, cfg.normal_embedding_dim)
+
+    model = GeoRelVLA(
+        cfg, backbone=backbone, depth_expert=expert,
+        depth_codebook=codebook.to(args.device),
+        normal_expert=normal_expert,
+        normal_codebook=normal_codebook.to(args.device) if normal_codebook is not None else None,
+    )
     log.info("GeoRelVLA constructed: %s", repr(model))
 
     # Phase-2 resume restoration: if --action-expert-ckpt is a GeoRelVLA-saved
@@ -396,14 +434,26 @@ def main() -> int:
             with torch.no_grad():
                 indices = vq.encode_indices(depth).reshape(depth.size(0), -1)  # (B, N_lat)
 
-            out = model(rgb, depth_target_indices=indices)
+            # Phase-2: compute normal-target indices on the fly from depth
+            normal_indices = None
+            if normal_vq is not None:
+                from georel_vla.data.normal_from_depth import depth_to_normal_torch  # noqa: PLC0415
+                with torch.no_grad():
+                    normal = depth_to_normal_torch(depth)  # (B, 3, H, W)
+                    normal_indices = normal_vq.encode_indices(normal).reshape(depth.size(0), -1)
 
-            # depth-side compute_losses always; for pi0 backbone we then add the
-            # CFM action loss DIRECTLY (forward_action_loss already returns a scalar
-            # loss; passing it through compute_losses' MSE would square it).
+            out = model(rgb, depth_target_indices=indices)
+            # Phase-2: also forward through normal head if enabled
+            normal_logits = None
+            if normal_indices is not None and train_module.normal_expert is not None:
+                normal_out = train_module.forward_normal(out["siglip"])
+                normal_logits = normal_out.get("normal_logits")
+
             losses = train_module.compute_losses(
                 depth_logits=out["depth_logits"],
                 depth_target_indices=indices,
+                normal_logits=normal_logits,
+                normal_target_indices=normal_indices,
                 step=step, gamma=args.lambda_gamma,
             )
             if args.backbone == "pi0":
@@ -465,12 +515,15 @@ def main() -> int:
                 }
                 if "action" in losses:
                     row["loss_action"] = float(losses["action"].item())
+                if "normal" in losses:
+                    row["loss_normal"] = float(losses["normal"].item())
                 metrics.append(row)
                 log.info(
-                    "ep=%d step=%d opt=%d lr=%.2e total=%.4f depth=%.4f action=%s lambda_t=%.4g t=%.0fs",
+                    "ep=%d step=%d opt=%d lr=%.2e total=%.4f depth=%.4f action=%s normal=%s lambda_t=%.4g t=%.0fs",
                     epoch, step, optim_step, row["lr"],
                     row["loss_total"], row["loss_depth"],
                     f"{row['loss_action']:.4f}" if "loss_action" in row else "n/a",
+                    f"{row['loss_normal']:.4f}" if "loss_normal" in row else "off",
                     row["lambda_t"], row["elapsed_sec"],
                 )
 
